@@ -1,0 +1,465 @@
+{
+  "manifestVersion": "1.0",
+  "note": "配置数据下发策略。基准原文是「无 WHERE 的 DELETE + 巨型 INSERT」的全量覆盖写法，一行都不能直接执行，升级 SQL 一律由渲染器按本规则重新生成。全库外键约束数为 0，删行不报错只会静默产生孤儿，所以除 vao_region_coordinate 外一律不删现场多出的行。",
+  "tables": [
+    {
+      "table": "vao_region_coordinate",
+      "category": "A",
+      "strategy": "FULL_OVERWRITE",
+      "key": [
+        "id"
+      ],
+      "deletePredicate": "description = '全国行政区划坐标数据，来源：pfinal/city'",
+      "reason": "全仓 0 条写路径；唯一引用是 SELECT；regionname 有 UNIQUE 索引。按 description 标记删除比 TRUNCATE 安全，现场手工加的其他来源行会保留"
+    },
+    {
+      "table": "vao_recordtype",
+      "category": "A",
+      "strategy": "REBUILD",
+      "key": [
+        "id"
+      ],
+      "dependsOn": [
+        "vao_category"
+      ],
+      "reason": "元数据表（实测现场 198 个 id 全部落在基准 212 内，无现场独有行）。2026 增量里 160 条数据操作打在本表。count 同 vao_entitytype",
+      "rebuildCheckColumns": [
+        "name",
+        "ord",
+        "tablename",
+        "icon16",
+        "icon32",
+        "icon48",
+        "icon64",
+        "showedathome",
+        "recordidcolumn",
+        "categoryid",
+        "isbackduplicate",
+        "datetimecolumn",
+        "datecolumn",
+        "timecolumn",
+        "showclass",
+        "showmethod",
+        "usage"
+      ],
+      "preserve": [
+        "count"
+      ]
+    },
+    {
+      "table": "vao_recordtype_column",
+      "category": "A",
+      "strategy": "REBUILD",
+      "key": [
+        "id"
+      ],
+      "dependsOn": [
+        "vao_recordtype"
+      ],
+      "reason": "随 vao_recordtype 一起重建。2026 增量 4808 条数据操作打在本表，占全部数据操作的 71%；稳定键 (recordtypeid, columnname) 本就不唯一（11 组一列多义），逐行对齐必然卡住，重建绕开该问题",
+      "rebuildCheckColumns": [
+        "name",
+        "ord",
+        "columnname",
+        "datatype",
+        "searchable",
+        "listable",
+        "archivable",
+        "duplicatable",
+        "insertable",
+        "dictionaries",
+        "expandable"
+      ],
+      "preserve": []
+    },
+    {
+      "table": "vao_entitytype",
+      "category": "A",
+      "strategy": "REBUILD",
+      "key": [
+        "id"
+      ],
+      "reason": "元数据表，基准与现场应逐行强一致（实测 id 40/40 完全一致）。数据全靠增量 SQL 维护，逐行 UPDATE 不如整表重建。count 是导入完成后回写的运行时统计，基准恒为 0，重建后回填",
+      "rebuildCheckColumns": [
+        "name",
+        "ord",
+        "tablename",
+        "icon16",
+        "icon32",
+        "icon48",
+        "icon64",
+        "showedathome",
+        "entitynocolumn",
+        "entitylabelcolumn",
+        "isdataentitytype"
+      ],
+      "preserve": [
+        "count"
+      ]
+    },
+    {
+      "table": "vao_category",
+      "category": "A",
+      "strategy": "MERGE_FREEZE",
+      "key": [
+        "id"
+      ],
+      "freeze": [],
+      "reason": "删行会让 212 条 vao_recordtype.categoryid 悬空，故只增不删"
+    },
+    {
+      "table": "vao_linktype",
+      "category": "A",
+      "strategy": "MERGE_FREEZE",
+      "key": [
+        "id"
+      ],
+      "freeze": [],
+      "reason": "有 PRIMARY KEY，id 稳定"
+    },
+    {
+      "table": "vao_link_model",
+      "category": "A",
+      "strategy": "MERGE_FREEZE",
+      "key": [
+        "recordtypeid"
+      ],
+      "freeze": [
+        "id"
+      ],
+      "dependsOn": [
+        "vao_recordtype",
+        "vao_entitytype",
+        "vao_linktype"
+      ],
+      "reason": "最隐蔽的坑：按基准 id 插会造成同 recordtypeid 双行，而读取方要求 size()==1，落空直接返回 null → 该记录类型的关系模型静默失效、零报错"
+    },
+    {
+      "table": "vao_expand_menu",
+      "category": "A",
+      "strategy": "MERGE_FREEZE",
+      "key": [
+        "id"
+      ],
+      "freeze": [
+        "lastupdatorid",
+        "lastupdatedtime"
+      ],
+      "dependsOn": [
+        "vao_entitytype"
+      ],
+      "reason": "lastupdatorid 被写成随机 UUID 而非用户 id（已知 bug），是纯噪声。同表 parentid 自引用，插入需先父后子"
+    },
+    {
+      "table": "vao_expand_logic",
+      "category": "A",
+      "strategy": "MERGE_FREEZE",
+      "key": [
+        "id"
+      ],
+      "freeze": [],
+      "dependsOn": [
+        "vao_expand_menu"
+      ],
+      "reason": "expandclass 存的是 Java 类名，运行时靠反射 Class.forName 加载，老库不更新即 ClassNotFoundException —— 必须随包更新，全列跟基准走"
+    },
+    {
+      "table": "vao_expand_logic_parameter",
+      "category": "A",
+      "strategy": "MERGE_FREEZE",
+      "key": [
+        "expandlogicid",
+        "name"
+      ],
+      "freeze": [],
+      "dependsOn": [
+        "vao_expand_logic"
+      ],
+      "reason": "绝对禁用 id：后端编辑逻辑时按 expandlogicid 全删重插并重发 id。defaultvalue1/2 按拍板不保现场值"
+    },
+    {
+      "table": "vao_one_step_import_conf",
+      "category": "A",
+      "strategy": "MERGE_FREEZE",
+      "key": [
+        "id"
+      ],
+      "freeze": [],
+      "reason": "methodurl / cleanmethod 绑代码版本，本就该随包更新。注意基准自带整行重复，需先去重"
+    },
+    {
+      "table": "vao_datax2datao",
+      "category": "A",
+      "strategy": "MERGE_FREEZE",
+      "key": [
+        "version"
+      ],
+      "freeze": [
+        "id"
+      ],
+      "reason": "运行时按 version 查。改 id 会让 1111 行 tablemapping 全变孤儿 → 案件上传静默空跑。必须与 tablemapping 同事务"
+    },
+    {
+      "table": "vao_datax2datao_tablemapping",
+      "category": "A",
+      "strategy": "MERGE_FREEZE",
+      "key": [
+        "datax2dataoid",
+        "targettablename"
+      ],
+      "freeze": [
+        "jsonmappings"
+      ],
+      "dependsOn": [
+        "vao_datax2datao"
+      ],
+      "reason": "jsonmappings 是现场按本地 CK 表结构调过的列映射，覆盖会导致导入列错位"
+    },
+    {
+      "table": "vao_dictionary_table",
+      "category": "A",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "name"
+      ],
+      "reason": "拍板：只补充。vao_query.specification 的 JSON 里存着其 id，代码另有 7 处按 name 硬编码引用"
+    },
+    {
+      "table": "vao_dictionary_data",
+      "category": "A",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "tableid",
+        "key"
+      ],
+      "dependsOn": [
+        "vao_dictionary_table"
+      ],
+      "reason": "拍板：只补充。(tableid,value) 有大量重复不可作键。存量案件数据按 key 落库，改 key 即标签对不上。同表 parentkey 自引用，插入需先根后叶"
+    },
+    {
+      "table": "vao_entitytype_property",
+      "category": "A",
+      "strategy": "REBUILD",
+      "key": [
+        "id"
+      ],
+      "dependsOn": [
+        "vao_entitytype"
+      ],
+      "reason": "随 vao_entitytype 一起重建。后端按 entitytypeid 整组 delete+batchInsert 会重发 id（实测 163 行属此类），逐行对齐永远追不平，重建可一次性把 id 拉回基准",
+      "rebuildCheckColumns": [
+        "name",
+        "ord",
+        "columnname",
+        "datatype",
+        "searchable",
+        "listable",
+        "archivable",
+        "dictionaries",
+        "concisearchivable",
+        "expandable"
+      ],
+      "preserve": []
+    },
+    {
+      "table": "vao_recordtype_mapping_dictionary",
+      "category": "A",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "recordtypeid",
+        "mappingname",
+        "level"
+      ],
+      "dependsOn": [
+        "vao_recordtype",
+        "vao_recordtype_column"
+      ],
+      "reason": "每次数据导入成功都会自动写入。覆盖 = 全站办案人积累的表头映射习惯清零。必须在 vao_recordtype_column 之后执行：它存的是列的中文 name，改列名会打断映射"
+    },
+    {
+      "table": "vao_import_entry_conf",
+      "category": "A",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "entrytype",
+        "sourceid"
+      ],
+      "dependsOn": [
+        "vao_one_step_import_conf",
+        "vao_category",
+        "vao_recordtype"
+      ],
+      "reason": "后端有一处无 WHERE 的全表 DELETE 后重建。基准 230 行 isshow 全为 t，覆盖 = 现场隐藏过的导入入口一次性全部恢复显示"
+    },
+    {
+      "table": "vao_record_type_import_strategy",
+      "category": "A",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "recordtypeid"
+      ],
+      "dependsOn": [
+        "vao_recordtype",
+        "vao_entitytype"
+      ],
+      "reason": "按 recordtypeid upsert，每次保存换新 id。toentitymapping 多数行有现场内容"
+    },
+    {
+      "table": "vao_archive_related_entitytype",
+      "category": "A",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "id"
+      ],
+      "dependsOn": [
+        "vao_entitytype",
+        "vao_recordtype"
+      ],
+      "reason": "无业务唯一键，只能按 id。注意 relatedrecordtypeid 是多态列，一部分指向 vao_entitytype、一部分指向 vao_recordtype，引用校验不能只 join 一张表"
+    },
+    {
+      "table": "vao_archive_related_recordtype",
+      "category": "A",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "id"
+      ],
+      "dependsOn": [
+        "vao_entitytype",
+        "vao_recordtype"
+      ],
+      "reason": "基准里存在完全重复行，需先去重"
+    },
+    {
+      "table": "vao_holiday_config",
+      "category": "A",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "name",
+        "year",
+        "holiday_type",
+        "holiday_source"
+      ],
+      "reason": "推翻「静态表」的初判：有完整 CRUD + Excel 导入 + 后台菜单。基准只到 2026 年，现场大概率已补 2027；含 valid=0 的软删记录，覆盖会复活"
+    },
+    {
+      "table": "vao_lab_verify_config_category",
+      "category": "A",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "id"
+      ],
+      "reason": "检验项配置，有完整 CRUD"
+    },
+    {
+      "table": "vao_lab_verify_config_item",
+      "category": "A",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "id"
+      ],
+      "dependsOn": [
+        "vao_lab_verify_config_category"
+      ],
+      "reason": "methodkey 绑代码，老现场必须补齐这几行功能才出得来"
+    },
+    {
+      "table": "vao_recordtype_import_template",
+      "category": "A",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "拍板：只做表列检查。整表是每个办案人自己存的导入模板，6 条写路径全是普通用户的导入弹框；团队增量 SQL 从未发过此表"
+    },
+    {
+      "table": "vao_archive_related_statistics",
+      "category": "A",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "拍板：只做表列检查。基准这 2 行的 statisticsqueryid/detailedqueryid 全指向 vao_query，而基准 vao_query 是 0 行，天生断链，下发即制造点不开的坏磁贴"
+    },
+    {
+      "table": "vao_system_opt",
+      "category": "B",
+      "strategy": "INSERT_ONLY",
+      "key": [
+        "key"
+      ],
+      "keyBlacklist": [
+        "DATAC_ADDRESS",
+        "LEARNING_ADDRESS",
+        "LEARNING_LIBRARY_CASE_ID",
+        "SYSTEM_NAME",
+        "SYSTEM_NAME_JD",
+        "SYSTEM_TYPE",
+        "SYSTEM_VERSION",
+        "SYSTEM_VERSION_NO",
+        "SYSTEM_LOGIN_WAY",
+        "PKILOGIN",
+        "ONLYPKILOGIN",
+        "HOME_PAGE",
+        "STOP_DATA_O",
+        "STOP_DATA_O_MESSAGE"
+      ],
+      "reason": "缺 key 补 key，已有 key 一律不覆盖。黑名单里全是开发机环境值或部署形态标识：DATAC_ADDRESS=127.0.0.1、LEARNING_ADDRESS=localhost、LEARNING_LIBRARY_CASE_ID 是开发机案件 UUID"
+    },
+    {
+      "table": "vao_connector",
+      "category": "C",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "含明文口令，下发即安全事故"
+    },
+    {
+      "table": "vao_user",
+      "category": "C",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "系统管理员账号，含口令哈希与身份证号，下发会重置现场管理员口令"
+    },
+    {
+      "table": "vao_usergroup",
+      "category": "C",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "下发会破坏现场组织架构"
+    },
+    {
+      "table": "vao_video",
+      "category": "C",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "教学视频演示数据，url 指向开发机地址"
+    },
+    {
+      "table": "vao_video_folder",
+      "category": "C",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "教学视频目录，同上"
+    },
+    {
+      "table": "vao_template",
+      "category": "C",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "confjson 里绑死一次性哈希表名 dx_source_xxx，换现场必然失效"
+    },
+    {
+      "table": "vao_fxq_module_authorization",
+      "category": "C",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "userid 全是同一个开发账号；DAO 是 delete 全表再插"
+    },
+    {
+      "table": "vao_case_table_field_conf",
+      "category": "C",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "某开发者的个人列偏好，且是 per-user 表"
+    },
+    {
+      "table": "vao_display_options",
+      "category": "C",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "显示选项，现场自行配置"
+    },
+    {
+      "table": "vao_lab_version",
+      "category": "C",
+      "strategy": "STRUCTURE_ONLY",
+      "reason": "由发版流程写入，不该由升级包决定"
+    }
+  ]
+}

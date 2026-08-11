@@ -1,0 +1,17 @@
+# 构建产物
+target/
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# 升级报告：单次运行的产物，SQL 原文附录动辄十几 MB，
+# 属于运行记录而非源码，不进版本库
+reports/
+doenv-report/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# macOS
+.DS_Store

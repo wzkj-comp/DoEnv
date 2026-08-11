@@ -1,0 +1,5 @@
+# 环境后处理器：把 DataO 的 spring.datasource.* 桥接成 doenv.schema-upgrade.*
+# 现场 doenv jar 与 datao jar 同目录、共用同一份 application.properties，
+# 运维不需要为本模块单独配连接信息。
+org.springframework.boot.env.EnvironmentPostProcessor=\
+com.doenv.schema.config.DataOConfigBridge

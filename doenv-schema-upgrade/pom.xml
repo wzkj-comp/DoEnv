@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.doenv</groupId>
+        <artifactId>doenv</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>doenv-schema-upgrade</artifactId>
+    <name>DoEnv :: Schema Upgrade</name>
+    <description>以纯净库为基准，比对现场库结构与配置数据并生成升级 SQL</description>
+
+    <dependencies>
+        <!--
+          所有 Spring 依赖一律 optional=true：
+            · 独立运行  —— optional 依赖仍在本模块自身的 runtime classpath 上，
+                          spring-boot-maven-plugin 会把它们打进 -exec.jar
+            · 被 datao-main 引用 —— optional 不向下传递，宿主用自己的那份，
+                          不会产生版本冲突
+          宿主（datao-main）已具备下列全部依赖。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!--
+          ClickHouse 驱动。与 datao-main 保持同一版本（0.2.6）——
+          宿主用的就是它，嵌入时不引入第二份驱动免得类冲突。
+          老驱动够用：本模块只做 DDL 与元数据查询，不涉及大批量读写。
+        -->
+        <dependency>
+            <groupId>ru.yandex.clickhouse</groupId>
+            <artifactId>clickhouse-jdbc</artifactId>
+            <version>0.2.6</version>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>${lombok.version}</version>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <properties>
+    <!-- 基准 SQL 的来源。与 datao-main 并列时自动打包进 jar；单独构建时该目录不存在，
+         maven-resources-plugin 会跳过，jar 内不带基准，改用外部目录配置 -->
+    <datao.baseline.dir>${project.basedir}/../../datao-main/src/main/resources/install</datao.baseline.dir>
+  </properties>
+
+  <build>
+    <!--
+      把 datao-main 里的基准 SQL 打进 jar。
+      现场部署形态是「一个 jar + 一份 application.properties」，基准必须自带，
+      否则运维还得单独放一份文件、还得配路径。
+      源目录不存在时 maven-resources-plugin 会自动跳过（DoEnv 单独构建时就这样），
+      那种 jar 仍可通过 doenv.schema-upgrade.*.baseline-dir 指外部目录。
+    -->
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+      </resource>
+      <resource>
+        <directory>${datao.baseline.dir}/pg-sql</directory>
+        <targetPath>install/pg-sql</targetPath>
+        <includes>
+          <include>PG系统纯净库-*.sql</include>
+        </includes>
+      </resource>
+      <resource>
+        <directory>${datao.baseline.dir}/clickhouse-sql</directory>
+        <targetPath>install/clickhouse-sql</targetPath>
+        <includes>
+          <include>CK单机*.sql</include>
+        </includes>
+      </resource>
+    </resources>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <mainClass>com.doenv.schema.standalone.DoEnvApplication</mainClass>
+                    <!--
+                      classifier=exec 是双形态的关键：
+                        · 主 artifact doenv-schema-upgrade-1.0.0.jar      → 普通 jar，供 pom 引用
+                        · 附加 artifact doenv-schema-upgrade-1.0.0-exec.jar → 可执行 fat jar
+                      不设 classifier 的话 repackage 会把主 artifact 替换成 fat jar，
+                      被 datao-main 引用时会因嵌套 BOOT-INF 结构而找不到类。
+                    -->
+                    <classifier>exec</classifier>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
