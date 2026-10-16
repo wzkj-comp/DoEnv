@@ -36,7 +36,18 @@ public final class UpgradeResultDocument {
                           List<String> blockers,
                           List<String> generatorErrors,
                           /** 本轮实际执行的差异项。用来把「重建了哪些表」单独摊开 */
-                          List<DiffItem> executedItems) {
+                          List<DiffItem> executedItems,
+                          /** 目标数据库地址（已去除密码/查询参数） */
+                          String address) {
+
+        /** 兼容不传数据库地址的调用方 */
+        public Section(String dbKind, String database, String extra, String baselineFile,
+                       int objectsBefore, int objectsAfter, List<ExecutionResult> rounds,
+                       List<DiffItem> remaining, List<String> blockers,
+                       List<String> generatorErrors, List<DiffItem> executedItems) {
+            this(dbKind, database, extra, baselineFile, objectsBefore, objectsAfter,
+                    rounds, remaining, blockers, generatorErrors, executedItems, "");
+        }
 
         /** 兼容不关心重建清单的调用方 */
         public Section(String dbKind, String database, String extra, String baselineFile,
@@ -44,7 +55,7 @@ public final class UpgradeResultDocument {
                        List<DiffItem> remaining, List<String> blockers,
                        List<String> generatorErrors) {
             this(dbKind, database, extra, baselineFile, objectsBefore, objectsAfter,
-                    rounds, remaining, blockers, generatorErrors, List.of());
+                    rounds, remaining, blockers, generatorErrors, List.of(), "");
         }
     }
 
@@ -89,7 +100,25 @@ public final class UpgradeResultDocument {
         sb.append("════════════════════════════════════════════════════════════════════════\n");
         sb.append("生成时间 : ").append(now).append('\n');
         sb.append("总体结论 : ").append(verdict).append('\n');
-        sb.append("语句合计 : ").append(allTotal).append(" 条，成功 ").append(allOk)
+
+        boolean dryRun = sections.stream().flatMap(s -> s.rounds().stream())
+                .anyMatch(ExecutionResult::isDryRun);
+        sb.append("\n核心升级结果").append(dryRun ? "（干跑预估，未落库）" : "（实际完成）").append("：\n");
+        sb.append(String.format("  %-5s %8s %8s %8s %8s %10s %12s %12s %14s%n",
+                "数据库", "新表", "新列", "删列", "改名列", "新索引",
+                "新增数据", "更新数据", "删除/覆盖数据"));
+        sb.append("  ").append("─".repeat(102)).append('\n');
+        Impact totalImpact = new Impact();
+        for (Section s : sections) {
+            Impact impact = impactOf(s);
+            totalImpact.add(impact);
+            appendImpact(sb, s.dbKind(), impact);
+        }
+        if (sections.size() > 1) {
+            appendImpact(sb, "合计", totalImpact);
+        }
+
+        sb.append("\n执行明细统计：共 ").append(allTotal).append(" 条 SQL，成功 ").append(allOk)
                 .append("，跳过 ").append(allSkipped).append("，失败 ").append(allFailed).append('\n');
 
         sb.append("\n涉及的库：\n");
@@ -150,6 +179,94 @@ public final class UpgradeResultDocument {
         }
 
         return sb.toString();
+    }
+
+    /** 首页核心指标；结构按逻辑对象去重，数据按实际成功语句的影响行数累计。 */
+    private static final class Impact {
+        private int tables;
+        private int columns;
+        private int droppedColumns;
+        private int renamedColumns;
+        private int indexes;
+        private long insertedRows;
+        private long updatedRows;
+        private long deletedRows;
+
+        private void add(Impact other) {
+            tables += other.tables;
+            columns += other.columns;
+            droppedColumns += other.droppedColumns;
+            renamedColumns += other.renamedColumns;
+            indexes += other.indexes;
+            insertedRows += other.insertedRows;
+            updatedRows += other.updatedRows;
+            deletedRows += other.deletedRows;
+        }
+    }
+
+    private static Impact impactOf(Section section) {
+        Impact out = new Impact();
+        java.util.Set<String> tables = new java.util.LinkedHashSet<>();
+        java.util.Set<String> columns = new java.util.LinkedHashSet<>();
+        java.util.Set<String> droppedColumns = new java.util.LinkedHashSet<>();
+        java.util.Set<String> renamedColumns = new java.util.LinkedHashSet<>();
+        java.util.Set<String> indexes = new java.util.LinkedHashSet<>();
+
+        section.rounds().stream().flatMap(r -> r.getStatements().stream())
+                .filter(x -> "OK".equals(x.getStatus()))
+                .forEach(x -> {
+                    String table = nz(x.getTable());
+                    String object = nz(x.getObjectName());
+                    switch (nz(x.getAction())) {
+                        case "CREATE_TABLE" -> {
+                            tables.add(section.dbKind() + "|" + table);
+                            // CK 新表的跳数索引直接写在 CREATE TABLE 内，不会另跑 ADD INDEX。
+                            out.indexes += inlineIndexCount(x.getSql());
+                        }
+                        case "ADD_COLUMN" -> columns.add(
+                                section.dbKind() + "|" + table + "|" + object);
+                        case "DROP_COLUMN" -> droppedColumns.add(
+                                section.dbKind() + "|" + table + "|" + object);
+                        case "RENAME_COLUMN" -> renamedColumns.add(
+                                section.dbKind() + "|" + table + "|" + object);
+                        case "CREATE_INDEX", "ADD_INDEX" -> indexes.add(
+                                section.dbKind() + "|" + table + "|" + object);
+                        case "INSERT" -> out.insertedRows += positiveRows(x);
+                        case "UPDATE" -> out.updatedRows += positiveRows(x);
+                        case "DELETE" -> out.deletedRows += positiveRows(x);
+                        default -> {
+                        }
+                    }
+                });
+        out.tables = tables.size();
+        out.columns = columns.size();
+        out.droppedColumns = droppedColumns.size();
+        out.renamedColumns = renamedColumns.size();
+        out.indexes += indexes.size();
+        return out;
+    }
+
+    private static long positiveRows(StatementLog log) {
+        return Math.max(0, log.getRowsAffected());
+    }
+
+    private static int inlineIndexCount(String sql) {
+        if (sql == null) {
+            return 0;
+        }
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("(?im)^\\s*INDEX\\s+[^\\n]+$").matcher(sql);
+        int count = 0;
+        while (matcher.find()) {
+            count++;
+        }
+        return count;
+    }
+
+    private static void appendImpact(StringBuilder sb, String db, Impact i) {
+        sb.append(String.format("  %-5s %8d %8d %8d %8d %10d %,10d行 %,10d行 %,12d行%n",
+                db, i.tables, i.columns, i.droppedColumns, i.renamedColumns, i.indexes,
+                i.insertedRows, i.updatedRows, i.deletedRows));
     }
 
     /**
@@ -358,7 +475,7 @@ public final class UpgradeResultDocument {
             Map<String, Integer> byType = new TreeMap<>();
             infos.forEach(d -> byType.merge(d.getType().name(), 1, Integer::sum));
             sb.append("\n  【仅提示，不处理】").append(byType)
-                    .append("  —— 严格单向，现场多出的对象永不生成 DROP\n");
+                    .append("  —— 以下提示项不生成 SQL；PG 多余列另按 COLUMN_DROP 执行\n");
             infos.stream().limit(15).forEach(d -> sb.append("    ")
                     .append(d.getTableName())
                     .append(d.getObjectName() == null ? "" : "." + d.getObjectName())

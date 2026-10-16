@@ -24,6 +24,6 @@ public class DiffOptions {
     /** 是否比对约束（主键/唯一/CHECK）。基准里大量表本就无主键，缺主键是常态 */
     private boolean checkConstraint = true;
 
-    /** 是否报告现场多出的对象（只报告，永不生成 DDL） */
+    /** 是否处理/报告现场多出的对象：PG 多余列会删除，其余额外对象只报告 */
     private boolean reportExtra = true;
 }

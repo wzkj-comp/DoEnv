@@ -97,6 +97,10 @@ public class PgBaselineParser {
             parseSetval(stmt, bundle);
             return;
         }
+        if (upper.startsWith("DO ") || upper.startsWith("DO$")) {
+            parseDoBlock(stmt, bundle);
+            return;
+        }
         if (upper.startsWith("ALTER SEQUENCE")) {
             // 只有 OWNER TO，无结构含义
             bundle.discard("SEQUENCE_OWNER");
@@ -405,6 +409,28 @@ public class PgBaselineParser {
         bundle.discard("ALTER_OTHER");
     }
 
+    /**
+     * 解析纯净库导出器生成的幂等约束块。
+     *
+     * <p>导出器把 {@code ALTER TABLE ... ADD CONSTRAINT} 包在 {@code DO $$} 的
+     * {@code IF NOT EXISTS} 中，DoEnv 只需要提取其中的结构定义，不复用控制流原文。
+     * 其他 DO 块不猜测含义，明确计入丢弃统计。
+     */
+    private void parseDoBlock(String stmt, BaselineBundle bundle) {
+        String upper = stmt.toUpperCase(Locale.ROOT);
+        int alterAt = upper.indexOf("ALTER TABLE");
+        if (alterAt < 0) {
+            bundle.discard("DO_OTHER");
+            return;
+        }
+        List<String> inner = SqlStatementSplitter.split(stmt.substring(alterAt));
+        if (inner.isEmpty() || !inner.get(0).trim().toUpperCase(Locale.ROOT).startsWith("ALTER TABLE")) {
+            bundle.discard("DO_UNPARSED");
+            return;
+        }
+        parseAlterTable(inner.get(0).trim(), bundle);
+    }
+
     // ────────────────────────── CREATE INDEX ──────────────────────────
 
     private void parseCreateIndex(String stmt, BaselineBundle bundle) {
@@ -428,7 +454,8 @@ public class PgBaselineParser {
             "^CREATE\\s+SEQUENCE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?([^\\s;]+)", Pattern.CASE_INSENSITIVE);
 
     private static final Pattern SETVAL = Pattern.compile(
-            "SETVAL\\s*\\(\\s*'([^']+)'\\s*,\\s*(-?\\d+)\\s*(?:,\\s*(true|false)\\s*)?\\)",
+            "SETVAL\\s*\\(\\s*'([^']+)'\\s*(?:::\\s*(?:PG_CATALOG\\.)?REGCLASS)?"
+                    + "\\s*,\\s*(-?\\d+)\\s*(?:,\\s*(true|false)\\s*)?\\)",
             Pattern.CASE_INSENSITIVE);
 
     private void parseCreateSequence(String stmt, BaselineBundle bundle) {

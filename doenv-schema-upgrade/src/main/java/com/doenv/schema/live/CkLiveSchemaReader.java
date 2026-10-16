@@ -8,6 +8,8 @@ import com.doenv.schema.model.SchemaModel;
 import com.doenv.schema.model.TableModel;
 import com.doenv.schema.model.ViewModel;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -24,6 +26,8 @@ import java.util.Set;
  * 拓扑只在渲染期重新出现 —— 否则每一类差异都要写两遍。
  */
 public class CkLiveSchemaReader {
+
+    private static final Logger log = LoggerFactory.getLogger(CkLiveSchemaReader.class);
 
     /** 分布式现场里本地表的后缀 */
     public static final String LOCAL_SUFFIX = "_local";
@@ -118,9 +122,12 @@ public class CkLiveSchemaReader {
      * 与基准 SQL 原文不会逐字相同，比对时必须走 {@link CkIndexModel#normalizedExpression()}。
      */
     private void readIndexes(Map<String, TableModel> byPhysical) {
-        // 必须读 type_full 而不是 type：type 只有类型名（set），带参数的完整定义在
-        // type_full（set(1000)）。读错列会让所有带参数的索引永远判为「定义不同」
-        String sql = "SELECT table, name, expr, type_full, granularity "
+        // 新版 type_full 保存完整定义（如 set(1000)）；22.8 等旧版本没有这个列，
+        // 只能退回 type。先查 system.columns 再拼 SELECT，不能直接探测后靠异常回退，
+        // 否则会让整个升级在“启动/比对阶段”中断。
+        String typeColumn = indexTypeColumn();
+        String sql = "SELECT table, name, expr" + (typeColumn == null ? "" : ", " + typeColumn)
+                + ", granularity "
                 + "FROM system.data_skipping_indices WHERE database = currentDatabase() "
                 + "ORDER BY table, name";
         jdbc.query(sql, rs -> {
@@ -131,10 +138,36 @@ public class CkLiveSchemaReader {
             CkIndexModel idx = new CkIndexModel();
             idx.setName(rs.getString("name"));
             idx.setExpression(rs.getString("expr"));
-            idx.setType(rs.getString("type_full"));
+            // 极老版本若两列都没有，保留空类型：同名索引会被报告为定义未知，
+            // 但不会误判为缺失而重复 ADD INDEX。
+            idx.setType(typeColumn == null ? "" : rs.getString(typeColumn));
             idx.setGranularity(rs.getInt("granularity"));
             t.getCk().getIndexes().add(idx);
         });
+    }
+
+    private String indexTypeColumn() {
+        try {
+            Set<String> columns = new LinkedHashSet<>(jdbc.queryForList(
+                    "SELECT name FROM system.columns WHERE database = 'system' "
+                            + "AND table = 'data_skipping_indices'", String.class));
+            return resolveIndexTypeColumn(columns);
+        } catch (RuntimeException e) {
+            // 这项只影响“索引定义是否能精确比对”，绝不能反过来阻断整个结构升级。
+            log.warn("无法读取 system.data_skipping_indices 的列定义，索引类型将按未知处理：{}",
+                    e.getMessage());
+            return null;
+        }
+    }
+
+    static String resolveIndexTypeColumn(Set<String> columns) {
+        if (columns.contains("type_full")) {
+            return "type_full";
+        }
+        if (columns.contains("type")) {
+            return "type";
+        }
+        return null;
     }
 
     private Map<String, TableModel> readTables(SchemaModel model, CkTopology topology) {

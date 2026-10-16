@@ -125,7 +125,15 @@ class SchemaDiffIntegrationTest {
 
         assertFalse(allSql.contains("DROP TABLE"), "生成的 SQL 不允许出现 DROP TABLE");
         assertFalse(allSql.contains("TRUNCATE"), "生成的 SQL 不允许出现 TRUNCATE");
-        assertFalse(allSql.contains("DROP COLUMN"), "生成的 SQL 不允许出现 DROP COLUMN");
+        diffs.stream()
+                .flatMap(d -> d.getDdl().stream().map(sql -> java.util.Map.entry(d, sql)))
+                .filter(x -> x.getValue().toUpperCase().contains("DROP COLUMN"))
+                .forEach(x -> {
+                    assertTrue(x.getKey().getType() == DiffType.COLUMN_DROP,
+                            "只有 COLUMN_DROP 可以生成删列 SQL");
+                    assertFalse(x.getValue().toUpperCase().contains("CASCADE"),
+                            "删列不得使用 CASCADE");
+                });
 
         // 现场多出的对象只能是 INFO 档，且不得生成任何 SQL
         diffs.stream()

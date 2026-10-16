@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -22,14 +23,8 @@ import java.util.stream.Collectors;
 /**
  * ClickHouse 配置数据比对。
  *
- * <p>规则很简单，只有一条：<b>按主键补缺，已存在的一律不动</b>。
- * <ul>
- *   <li>表是空的 → 基准的行全部插入</li>
- *   <li>表有数据 → 逐行看主键在不在，不在才补；在就跳过，<b>不更新、不删除</b></li>
- * </ul>
- *
- * <p>之所以敢这么简单，是因为这 7 张表实测全部以 {@code id} 为排序键且 id 100% 唯一，
- * 不存在 PG 那边「稳定键不唯一会刷中多行」的问题。
+ * <p>已明确的 7 张配置表按 id 只补不改；后续新数据表按 id 补缺并更新差异列，
+ * 四个审计字段不覆盖。没有 id 的新表不猜排序键，直接转人工。
  *
  * <p>CK 没有 {@code INSERT ... WHERE NOT EXISTS} 这种写法（相关子查询支持有限），
  * 所以做法是：先把现场已有的主键读出来，在内存里算出缺哪些，再拼一条批量 INSERT。
@@ -43,10 +38,32 @@ public class CkSeedDiffEngine {
 
     private final JdbcTemplate jdbc;
     private final boolean distributed;
+    private final String clusterRef;
+    private final SeedManifest manifest;
 
     public CkSeedDiffEngine(JdbcTemplate jdbc, boolean distributed) {
+        this(jdbc, distributed, distributed ? "'{cluster}'" : null, loadDefaultManifest());
+    }
+
+    public CkSeedDiffEngine(JdbcTemplate jdbc, boolean distributed, String clusterRef) {
+        this(jdbc, distributed, clusterRef, loadDefaultManifest());
+    }
+
+    public CkSeedDiffEngine(JdbcTemplate jdbc, boolean distributed,
+                            String clusterRef, SeedManifest manifest) {
         this.jdbc = jdbc;
         this.distributed = distributed;
+        this.clusterRef = clusterRef;
+        this.manifest = manifest;
+    }
+
+    private static SeedManifest loadDefaultManifest() {
+        try {
+            return SeedManifest.load(new org.springframework.core.io.ClassPathResource(
+                    "doenv/ck-seed-manifest.json"));
+        } catch (Exception e) {
+            throw new IllegalStateException("读取 CK 数据规则失败：" + e.getMessage(), e);
+        }
     }
 
     /**
@@ -61,20 +78,21 @@ public class CkSeedDiffEngine {
                 continue;
             }
             String table = seed.getTableName();
+            SeedTableRule rule = manifest.ruleFor(table);
             TableModel lt = live.findTable(table);
             if (lt == null) {
                 out.add(DiffItem.of(DiffType.SEED_ROW_MISSING, DiffLevel.INFO, table, null)
                         .note("现场缺表，配置数据待建表后再下发"));
                 continue;
             }
-            String keyCol = resolveKeyColumn(seed, lt);
+            String keyCol = resolveIdColumn(seed);
             if (keyCol == null) {
                 out.add(DiffItem.of(DiffType.SEED_ROW_MISSING, DiffLevel.MANUAL, table, null)
-                        .note("找不到可用主键（种子列里无 id、排序键也不在种子列中），无法安全补数据"));
+                        .note("后续新数据表没有 id 列，按规则不执行任何数据更新，等待人工选择稳定键"));
                 continue;
             }
             try {
-                diffOneTable(seed, table, keyCol, out);
+                diffOneTable(seed, table, keyCol, rule, out);
             } catch (RuntimeException e) {
                 out.add(DiffItem.of(DiffType.SEED_ROW_MISSING, DiffLevel.MANUAL, table, null)
                         .note("配置数据比对失败：" + e.getMessage()));
@@ -83,7 +101,24 @@ public class CkSeedDiffEngine {
         return out;
     }
 
-    private void diffOneTable(SeedTable seed, String table, String keyCol, List<DiffItem> out) {
+    private void diffOneTable(SeedTable seed, String table, String keyCol,
+                              SeedTableRule rule, List<DiffItem> out) {
+        Set<String> baselineDuplicates = duplicateBaselineKeys(seed, keyCol);
+        if (!baselineDuplicates.isEmpty()) {
+            out.add(DiffItem.of(DiffType.SEED_ROW_DIFF, DiffLevel.MANUAL, table, null)
+                    .note("基准 id 存在重复（" + baselineDuplicates.size()
+                            + " 组），本表不生成任何数据 SQL，请先清理纯净库")
+                    .note("重复 id 样例：" + baselineDuplicates.stream().limit(5).toList()));
+            return;
+        }
+        Set<String> liveDuplicates = duplicateLiveKeys(seed, table, keyCol);
+        if (!liveDuplicates.isEmpty()) {
+            out.add(DiffItem.of(DiffType.SEED_ROW_DIFF, DiffLevel.MANUAL, table, null)
+                    .note("现场 id 存在重复（" + liveDuplicates.size()
+                            + " 组），按 id UPDATE 会一次改多行，本表已全部转待审核")
+                    .note("重复 id 样例：" + liveDuplicates.stream().limit(5).toList()));
+            return;
+        }
         // 路由表可以直接查（Distributed 会转发到本地表），读主键走逻辑名即可
         Set<String> liveKeys = new LinkedHashSet<>(jdbc.queryForList(
                 "SELECT DISTINCT " + CkTokens.ident(keyCol) + " FROM " + CkTokens.ident(table),
@@ -91,26 +126,61 @@ public class CkSeedDiffEngine {
 
         // 按下标筛，才能取到与之对齐的 SQL 原始词法
         List<Map<String, String>> missing = new ArrayList<>();
+        List<Integer> existingIndexes = new ArrayList<>();
         for (int i = 0; i < seed.getRowCount(); i++) {
             String k = seed.getRows().get(i).get(keyCol);
             if (k != null && !liveKeys.contains(k)) {
                 missing.add(seed.rawRow(i));
+            } else if (k != null) {
+                existingIndexes.add(i);
             }
         }
 
-        if (missing.isEmpty()) {
-            out.add(DiffItem.of(DiffType.SEED_ROW_DIFF, DiffLevel.INFO, table, null)
-                    .note("配置数据已齐（基准 " + seed.getRowCount() + " 行，现场已有 "
-                            + liveKeys.size() + " 个 " + keyCol + "），无需补充"));
-            return;
+        if (!missing.isEmpty()) {
+            appendMissing(seed, table, keyCol, liveKeys, missing, out);
         }
 
+        int updatedValues = 0;
+        if (rule.getStrategy() == SeedStrategy.MERGE_FREEZE && !existingIndexes.isEmpty()) {
+            Map<String, Map<String, String>> liveRows = loadLiveRows(
+                    seed, table, keyCol, existingIndexes);
+            List<String> updates = new ArrayList<>();
+            for (Integer rowIndex : existingIndexes) {
+                Map<String, String> base = seed.getRows().get(rowIndex);
+                Map<String, String> live = liveRows.get(base.get(keyCol));
+                if (live == null) {
+                    continue;
+                }
+                List<String> changed = changedColumns(seed, rowIndex, live, rule, keyCol);
+                if (!changed.isEmpty()) {
+                    updates.add(renderUpdate(table, seed, rowIndex, changed, keyCol));
+                    updatedValues += changed.size();
+                }
+            }
+            if (!updates.isEmpty()) {
+                DiffItem d = DiffItem.of(DiffType.SEED_ROW_DIFF, DiffLevel.CONFIRM, table, null);
+                d.setLiveDef(updates.size() + " 行存在 " + updatedValues + " 个差异值");
+                d.note("按 id 更新差异列；不更新 creatorid、createdtime、lastupdatorid、lastupdatedtime；不删除现场数据");
+                updates.forEach(d::sql);
+                out.add(d);
+            }
+        }
+
+        if (missing.isEmpty() && updatedValues == 0) {
+            out.add(DiffItem.of(DiffType.SEED_ROW_DIFF, DiffLevel.INFO, table, null)
+                    .note("配置数据已齐（基准 " + seed.getRowCount() + " 行，现场已有 "
+                            + liveKeys.size() + " 个 " + keyCol + "），无需更新"));
+        }
+    }
+
+    private void appendMissing(SeedTable seed, String table, String keyCol, Set<String> liveKeys,
+                               List<Map<String, String>> missing, List<DiffItem> out) {
         DiffItem d = DiffItem.of(DiffType.SEED_ROW_MISSING, DiffLevel.AUTO, table, null);
         d.setBaselineDef("基准 " + seed.getRowCount() + " 行");
         d.setLiveDef(liveKeys.isEmpty()
                 ? "现场空表，全量插入 " + missing.size() + " 行"
                 : "现场已有 " + liveKeys.size() + " 行，缺 " + missing.size() + " 行");
-        d.note("按 " + keyCol + " 补缺行；已存在的行不更新、不删除");
+        d.note("按 " + keyCol + " 补缺行；现场多出的行不删除");
         long adapted = missing.stream()
                 .flatMap(r -> r.values().stream())
                 .filter(v -> v != null && !v.equals(adaptDateTime(v)))
@@ -128,6 +198,106 @@ public class CkSeedDiffEngine {
         }
         out.add(d);
         log.debug("CK 配置数据 {}：缺 {} 行", table, missing.size());
+    }
+
+    private Map<String, Map<String, String>> loadLiveRows(SeedTable seed, String table,
+                                                           String keyCol,
+                                                           List<Integer> rowIndexes) {
+        String cols = seed.getColumns().stream().map(CkTokens::ident)
+                .collect(Collectors.joining(", "));
+        Map<String, Map<String, String>> rows = new LinkedHashMap<>();
+        for (int from = 0; from < rowIndexes.size(); from += BATCH) {
+            List<Integer> slice = rowIndexes.subList(from,
+                    Math.min(from + BATCH, rowIndexes.size()));
+            String keys = slice.stream()
+                    .map(i -> adaptDateTime(seed.rawRow(i).get(keyCol)))
+                    .collect(Collectors.joining(", "));
+            jdbc.query("SELECT " + cols + " FROM " + CkTokens.ident(table)
+                    + " WHERE " + CkTokens.ident(keyCol) + " IN (" + keys + ")", rs -> {
+                Map<String, String> row = new LinkedHashMap<>();
+                for (String column : seed.getColumns()) {
+                    row.put(column, rs.getString(column));
+                }
+                rows.put(row.get(keyCol), row);
+            });
+        }
+        return rows;
+    }
+
+    private static Set<String> duplicateBaselineKeys(SeedTable seed, String keyCol) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (Map<String, String> row : seed.getRows()) {
+            String key = row.get(keyCol);
+            if (key != null) {
+                counts.merge(key, 1, Integer::sum);
+            }
+        }
+        Set<String> duplicates = new LinkedHashSet<>();
+        counts.forEach((key, count) -> {
+            if (count > 1) {
+                duplicates.add(key);
+            }
+        });
+        return duplicates;
+    }
+
+    private Set<String> duplicateLiveKeys(SeedTable seed, String table, String keyCol) {
+        Set<String> duplicates = new LinkedHashSet<>();
+        List<String> keys = seed.getRawRows().stream()
+                .map(row -> row.get(keyCol))
+                .filter(java.util.Objects::nonNull)
+                .distinct()
+                .toList();
+        for (int from = 0; from < keys.size(); from += BATCH) {
+            String in = keys.subList(from, Math.min(from + BATCH, keys.size())).stream()
+                    .map(CkSeedDiffEngine::adaptDateTime)
+                    .collect(Collectors.joining(", "));
+            String sql = "SELECT toString(" + CkTokens.ident(keyCol) + ") FROM "
+                    + CkTokens.ident(table) + " WHERE " + CkTokens.ident(keyCol)
+                    + " IN (" + in + ") GROUP BY " + CkTokens.ident(keyCol)
+                    + " HAVING count() > 1";
+            duplicates.addAll(jdbc.queryForList(sql, String.class));
+        }
+        return duplicates;
+    }
+
+    static List<String> changedColumns(SeedTable seed, int rowIndex,
+                                       Map<String, String> live, SeedTableRule rule,
+                                       String keyCol) {
+        List<String> changed = new ArrayList<>();
+        Map<String, String> base = seed.getRows().get(rowIndex);
+        Map<String, String> raw = seed.rawRow(rowIndex);
+        for (String column : seed.getColumns()) {
+            if (column.equalsIgnoreCase(keyCol) || rule.isFrozen(column)) {
+                continue;
+            }
+            String expected = comparableBaseline(base.get(column), raw.get(column));
+            if (!java.util.Objects.equals(expected, live.get(column))) {
+                changed.add(column);
+            }
+        }
+        return changed;
+    }
+
+    private static String comparableBaseline(String parsed, String raw) {
+        if (parsed == null || raw == null || raw.equalsIgnoreCase("NULL")) {
+            return null;
+        }
+        String adapted = adaptDateTime(raw);
+        return adapted.equals(raw) ? parsed : CkTokens.unquoteLiteral(adapted);
+    }
+
+    String renderUpdate(String table, SeedTable seed, int rowIndex,
+                        List<String> changed, String keyCol) {
+        Map<String, String> raw = seed.rawRow(rowIndex);
+        String set = changed.stream()
+                .map(c -> CkTokens.ident(c) + " = " + adaptDateTime(raw.get(c)))
+                .collect(Collectors.joining(", "));
+        String physical = distributed ? table + "_local" : table;
+        String cluster = distributed ? " ON CLUSTER " + clusterRef : "";
+        return "ALTER TABLE " + CkTokens.ident(physical) + cluster
+                + " UPDATE " + set + " WHERE " + CkTokens.ident(keyCol) + " = "
+                + adaptDateTime(raw.get(keyCol)) + " SETTINGS mutations_sync = 2;";
     }
 
     /**
@@ -185,22 +355,11 @@ public class CkSeedDiffEngine {
             "'(\\d{4}-\\d{2}-\\d{2})T(\\d{2}:\\d{2})(:\\d{2})?(?:\\.\\d+)?"
                     + "(?:Z|[+-]\\d{2}:?\\d{2})?(?:\\[[^\\]]*\\])?'");
 
-    /**
-     * 定主键列。优先用种子里的 id，其次用表的排序键（要求是单列且在种子列里）。
-     * 都没有就返回 null，转人工 —— 宁可不做，也不能按不确定的键去插。
-     */
-    private String resolveKeyColumn(SeedTable seed, TableModel lt) {
+    /** 只认显式 id；没有 id 不猜 ORDER BY，转人工。 */
+    private String resolveIdColumn(SeedTable seed) {
         for (String c : seed.getColumns()) {
             if (c.equalsIgnoreCase("id")) {
                 return c;
-            }
-        }
-        if (lt.getCk() != null && lt.getCk().getOrderBy().size() == 1) {
-            String ob = lt.getCk().getOrderBy().get(0);
-            for (String c : seed.getColumns()) {
-                if (c.equalsIgnoreCase(ob)) {
-                    return c;
-                }
             }
         }
         return null;

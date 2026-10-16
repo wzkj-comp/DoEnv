@@ -4,7 +4,9 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import lombok.Data;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 单张表的配置数据下发规则。
@@ -34,6 +36,15 @@ public class SeedTableRule {
 
     /** FULL_OVERWRITE 专用：删除基准来源旧行的谓词。为空则拒绝执行，不允许无条件删 */
     private String deletePredicate;
+
+    /**
+     * 从纯净库快照中选取真正允许下发的行，列名 -> 期望值。
+     *
+     * <p>纯净库必须保留源库全部数据，不能在导出阶段按 manifest 删行；例如
+     * {@code vao_recordtype_import_template} 只允许下发 {@code level=3} 系统模板，
+     * {@code level=1/2} 的现场模板必须排除。
+     */
+    private Map<String, String> baselineFilter = new LinkedHashMap<>();
 
     /** 不下发的 key 值（配合 INSERT_ONLY，如 vao_system_opt 里的开发机地址） */
     private List<String> keyBlacklist = new ArrayList<>();

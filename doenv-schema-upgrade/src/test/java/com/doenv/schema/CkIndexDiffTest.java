@@ -196,4 +196,27 @@ class CkIndexDiffTest {
         assertFalse(diffs.stream().flatMap(d -> d.getDdl().stream())
                         .anyMatch(s -> s.toUpperCase().contains("DROP INDEX")));
     }
+
+    @Test
+    void 有数据的不可变结构差异只留跳过原因() {
+        String baseDdl = """
+                CREATE TABLE vax_demo (`id` String, `caseid` String)
+                ENGINE = MergeTree PARTITION BY caseid ORDER BY (id, caseid);
+                """;
+        String liveDdl = """
+                CREATE TABLE vax_demo (`id` String, `caseid` String)
+                ENGINE = MergeTree ORDER BY id;
+                """;
+        SchemaModel base = new CkBaselineParser().parse(baseDdl, "base", "base.sql").getSchema();
+        SchemaModel live = new CkBaselineParser().parse(liveDdl, "live", "live.sql").getSchema();
+
+        DiffItem item = diff(base, live, 10).stream()
+                .filter(d -> d.getType() == DiffType.CK_IMMUTABLE_DIFF)
+                .findFirst().orElseThrow();
+
+        assertEquals(DiffLevel.MANUAL, item.getLevel());
+        assertTrue(item.getDdl().isEmpty(), "待审核只应保留原因，不应输出迁移 SQL");
+        assertTrue(item.getNotes().stream().anyMatch(n -> n.contains("表有数据（10 行）")));
+        assertFalse(item.getNotes().stream().anyMatch(n -> n.contains("解决方案")));
+    }
 }

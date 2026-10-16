@@ -1,8 +1,8 @@
 package com.doenv.schema.diff;
 
 /**
- * 结构差异类型。严格单向：只处理「基准有·现场无」和「两边都有·定义不同」，
- * 「现场有·基准无」一律归到 *_EXTRA 且永不生成 DDL。
+ * 结构差异类型。表和索引保持单向补充；PG 列按纯净库强一致，
+ * 现场多余列使用 COLUMN_DROP 删除。
  */
 public enum DiffType {
 
@@ -11,6 +11,15 @@ public enum DiffType {
 
     /** 基准有列，现场缺 */
     COLUMN_MISSING,
+
+    /** PG 现场有、基准无的列。为列结构强一致而删除；不使用 CASCADE */
+    COLUMN_DROP,
+
+    /** 清单明确登记的字段改名 */
+    COLUMN_RENAME,
+
+    /** 清单登记了改名，但现场新旧列同时存在，禁止自动覆盖 */
+    COLUMN_RENAME_CONFLICT,
 
     /** 类型放宽且代价低：varchar(n) -> varchar(m>n)、varchar -> text。二进制兼容，不重写表 */
     TYPE_WIDEN_CHEAP,
@@ -78,7 +87,7 @@ public enum DiffType {
     /** 现场多出的表 */
     TABLE_EXTRA,
 
-    /** 现场多出的列 */
+    /** 现场多出的列（ClickHouse 只报告；PG 使用 COLUMN_DROP） */
     COLUMN_EXTRA,
 
     /** 现场多出的索引 */
@@ -117,5 +126,11 @@ public enum DiffType {
     CK_INDEX_DIFF,
 
     /** 现场多出的行 */
-    SEED_ROW_EXTRA
+    SEED_ROW_EXTRA,
+
+    /** 收尾检查：vao_user.systemauths 的 NULL 统一补为字符串 0 */
+    FINAL_SYSTEMAUTHS_CHECK,
+
+    /** 收尾检查：vax_item_label 引擎不一致时的安全迁移（新表、复制、核验、换名） */
+    FINAL_ITEM_LABEL_ENGINE_MIGRATION
 }

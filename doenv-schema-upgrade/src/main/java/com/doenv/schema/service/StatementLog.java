@@ -16,13 +16,16 @@ public class StatementLog {
     /** 所属表 */
     private String table;
 
+    /** 所属对象，如列名、索引名；用于把分布式 local/route 两条 SQL 归并成一个逻辑变更 */
+    private String objectName;
+
     /** 差异类型，如 COLUMN_MISSING / SEED_ROW_DIFF */
     private String diffType;
 
     /** 档位 AUTO / CONFIRM */
     private String level;
 
-    /** 动作归类：CREATE_TABLE / ADD_COLUMN / CREATE_INDEX / INSERT / UPDATE / DELETE / COMMENT / OTHER */
+    /** 动作归类：CREATE_TABLE / ADD_COLUMN / DROP_COLUMN / RENAME_COLUMN / CREATE_INDEX / INSERT / UPDATE / DELETE / COMMENT / OTHER */
     private String action;
 
     private String sql;

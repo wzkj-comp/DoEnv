@@ -7,6 +7,8 @@ import com.doenv.schema.model.SchemaModel;
 import com.doenv.schema.model.SequenceModel;
 import com.doenv.schema.model.TableModel;
 import com.doenv.schema.render.PgDdlRenderer;
+import com.doenv.schema.rename.ColumnRenameRule;
+import com.doenv.schema.rename.ColumnRenameRules;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -18,17 +20,21 @@ import java.util.Set;
 /**
  * 结构差异引擎。
  *
- * <p><b>严格单向</b>：只处理「基准有·现场无」和「两边都有·定义不同」。
- * 「现场有·基准无」一律只报告，代码里没有任何生成 DROP 的分支 ——
- * 现场存在大量运行时动态对象（检材导入来源表、临时表、报表预计算表），
- * 删它们等于删业务数据，而全库 0 条外键约束，删错了不会报任何错。
+ * <p>表和索引保持单向补充，不删除现场对象；列结构以纯净库为准，
+ * 现场多出的 PG 列会生成不带 {@code CASCADE} 的删除语句。列顺序不参与比对。
  */
 public class SchemaDiffEngine {
 
     private final PgDdlRenderer renderer;
+    private final List<ColumnRenameRule> renameRules;
 
     public SchemaDiffEngine(PgDdlRenderer renderer) {
+        this(renderer, List.of());
+    }
+
+    public SchemaDiffEngine(PgDdlRenderer renderer, List<ColumnRenameRule> renameRules) {
         this.renderer = renderer;
+        this.renameRules = renameRules == null ? List.of() : List.copyOf(renameRules);
     }
 
     public List<DiffItem> diff(SchemaModel baseline, SchemaModel live, DiffOptions opt) {
@@ -135,6 +141,43 @@ public class SchemaDiffEngine {
 
         for (ColumnModel bc : bt.getColumns()) {
             ColumnModel lc = findExactColumn(lt, bc.getName());
+            ColumnRenameRule rename = ColumnRenameRules.byTarget(
+                    renameRules, bt.getName(), bc.getName());
+            ColumnModel old = rename == null ? null : findExactColumn(lt, rename.getFrom());
+
+            if (old != null) {
+                matched.add(old.getName());
+                if (lc != null) {
+                    matched.add(lc.getName());
+                    // 当前目标结构本身同时保留新旧两列时，不属于冲突。
+                    // 这类清单只服务于更老现场：缺目标列时把旧数据迁到新名，
+                    // 下一轮再按基准补回仍需保留的来源列。
+                    if (findExactColumn(bt, rename.getFrom()) != null) {
+                        diffOneColumn(bt, bc, lc, opt, out);
+                        continue;
+                    }
+                    out.add(DiffItem.of(DiffType.COLUMN_RENAME_CONFLICT, DiffLevel.MANUAL,
+                                    bt.getName(), bc.getName())
+                            .note("rename 清单要求 " + rename.getFrom() + " → " + rename.getTo()
+                                    + "，但现场新旧列同时存在。为避免覆盖数据，禁止自动改名或删旧列"));
+                    diffOneColumn(bt, bc, lc, opt, out);
+                    continue;
+                }
+
+                DiffItem d = DiffItem.of(DiffType.COLUMN_RENAME, DiffLevel.CONFIRM,
+                        bt.getName(), bc.getName());
+                d.setLiveDef(rename.getFrom());
+                d.setBaselineDef(rename.getTo());
+                d.sql(renderer.renameColumn(bt.getName(), rename.getFrom(), rename.getTo()));
+                d.note("按 rename 清单改名，保留原列数据"
+                        + (rename.getReason() == null || rename.getReason().isBlank()
+                        ? "" : "：" + rename.getReason()));
+                out.add(d);
+                // 改名项先执行；后续类型、注释修正使用目标列名，顺序天然正确。
+                diffOneColumn(bt, bc, old, opt, out);
+                continue;
+            }
+
             if (lc == null) {
                 ColumnModel ci = lt.findColumn(bc.getName());
                 if (ci != null) {
@@ -168,9 +211,22 @@ public class SchemaDiffEngine {
         if (opt.isReportExtra()) {
             for (ColumnModel lc : lt.getColumns()) {
                 if (!matched.contains(lc.getName())) {
-                    out.add(DiffItem.of(DiffType.COLUMN_EXTRA, DiffLevel.INFO,
-                                    bt.getName(), lc.getName())
-                            .note("现场多出的列，只报告不处理"));
+                    ColumnRenameRule stale = ColumnRenameRules.bySource(
+                            renameRules, bt.getName(), lc.getName());
+                    if (stale != null) {
+                        out.add(DiffItem.of(DiffType.COLUMN_RENAME_CONFLICT, DiffLevel.MANUAL,
+                                        bt.getName(), stale.getTo())
+                                .note("rename 清单登记了 " + stale.getFrom() + " → " + stale.getTo()
+                                        + "，但目标列不在当前纯净库表结构中。保留旧列，需修正清单"));
+                        continue;
+                    }
+                    DiffItem d = DiffItem.of(DiffType.COLUMN_DROP, DiffLevel.CONFIRM,
+                            bt.getName(), lc.getName());
+                    d.setLiveDef(describe(lc));
+                    d.sql(renderer.dropColumn(bt.getName(), lc.getName()));
+                    d.note("现场多出的列，按纯净库强一致规则删除；不使用 CASCADE。"
+                            + "若被视图等外部对象依赖，PostgreSQL 会拒绝删除，本项回滚并登记失败");
+                    out.add(d);
                 }
             }
         }

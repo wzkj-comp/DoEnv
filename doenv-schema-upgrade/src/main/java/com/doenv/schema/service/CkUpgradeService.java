@@ -7,10 +7,12 @@ import com.doenv.schema.diff.CkSchemaDiffEngine;
 import com.doenv.schema.diff.DiffItem;
 import com.doenv.schema.diff.DiffLevel;
 import com.doenv.schema.diff.DiffOptions;
+import com.doenv.schema.diff.FinalCheckDiffEngine;
 import com.doenv.schema.live.CkLiveSchemaReader;
 import com.doenv.schema.live.CkTopology;
 import com.doenv.schema.model.SchemaModel;
 import com.doenv.schema.render.CkDdlRenderer;
+import com.doenv.schema.rename.RenameManifest;
 import com.zaxxer.hikari.HikariDataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,6 +43,8 @@ public class CkUpgradeService implements AutoCloseable {
     private final HikariDataSource ds;
     private final JdbcTemplate jdbc;
     private final CkLiveSchemaReader reader;
+    private final RenameManifest renameManifest;
+    private final List<String> renameManifestErrors;
 
     private BaselineBundle baseline;
     private String baselineName = "-";
@@ -56,6 +60,17 @@ public class CkUpgradeService implements AutoCloseable {
         ds.setPoolName("doenv-ck");
         this.jdbc = new JdbcTemplate(ds);
         this.reader = new CkLiveSchemaReader(jdbc);
+        RenameManifest loaded;
+        List<String> errors = new ArrayList<>();
+        try {
+            loaded = RenameManifest.loadDefault();
+            errors.addAll(loaded.validate());
+        } catch (Exception e) {
+            loaded = new RenameManifest();
+            errors.add("字段改名清单读取失败：" + e.getMessage());
+        }
+        this.renameManifest = loaded;
+        this.renameManifestErrors = List.copyOf(errors);
     }
 
     @Override
@@ -237,12 +252,18 @@ public class CkUpgradeService implements AutoCloseable {
         CkDdlRenderer renderer = new CkDdlRenderer(
                 env.topology(), env.clusterRef(), env.zkMacrosOk());
         List<DiffItem> diffs = new java.util.ArrayList<>(
-                new CkSchemaDiffEngine(renderer, rowCounter(env.topology()))
+                new CkSchemaDiffEngine(renderer, rowCounter(env.topology()), renameManifest.getCk())
                         .diff(b.getSchema(), live, opt));
-        // 配置数据：按主键补缺，已存在的不动
+        // 配置数据：既有 7 张表只补不改；后续新表按 id 补缺并更新差异列
         diffs.addAll(new com.doenv.schema.seed.CkSeedDiffEngine(
-                jdbc, env.topology() == CkTopology.DISTRIBUTED)
+                jdbc, env.topology() == CkTopology.DISTRIBUTED, env.clusterRef())
                 .diff(b.getSeeds(), live));
+        // 固定收尾检查：只对明确授权的 vax_item_label 引擎差异做迁移。
+        // 追加在末尾，确保普通加列/改列已先完成，复制时两侧字段清单一致。
+        diffs.addAll(FinalCheckDiffEngine.itemLabelEngine(
+                b.getSchema().findTable(FinalCheckDiffEngine.ITEM_LABEL_TABLE),
+                live.findTable(FinalCheckDiffEngine.ITEM_LABEL_TABLE), renderer,
+                env.topology(), rowCounter(env.topology()).count(FinalCheckDiffEngine.ITEM_LABEL_TABLE)));
         return diffs;
     }
 
@@ -272,6 +293,11 @@ public class CkUpgradeService implements AutoCloseable {
         DiffOptions opt = new DiffOptions();
 
         for (int i = 1; i <= limit; i++) {
+            if (!renameManifestErrors.isEmpty()) {
+                genErrors.addAll(renameManifestErrors);
+                log.error("CK 字段改名清单无效，中止执行：{}", renameManifestErrors);
+                break;
+            }
             List<DiffItem> diffs = compare(env, opt);
 
             List<DiffItem> exec = diffs.stream()

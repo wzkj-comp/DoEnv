@@ -92,6 +92,7 @@ public class DoEnvCliRunner implements ApplicationRunner {
             exitCode = doRun();
         } catch (Exception e) {
             log.error("命令行执行失败", e);
+            writeFatalResultFiles(e);
             exitCode = 2;
         }
         if (exitAfterRun) {
@@ -126,8 +127,6 @@ public class DoEnvCliRunner implements ApplicationRunner {
         if (wantPg) {
             SchemaUpgradeService service = serviceProvider.getObject();
             UpgradeReport report = service.compare(opt);
-            writeCompareReport(dir.resolve("pg-compare-" + stamp + ".txt"), report);
-            writeSql(dir.resolve("pg-upgrade-" + stamp + ".sql"), report);
 
             List<ExecutionResult> rounds = compareOnly
                     ? List.of()
@@ -147,7 +146,7 @@ public class DoEnvCliRunner implements ApplicationRunner {
                     report.allDiffs().stream()
                             .filter(x -> x.getType() == com.doenv.schema.diff.DiffType.SEED_REBUILD)
                             .filter(x -> want.contains(x.getLevel()))
-                            .toList()));
+                            .toList(), safeAddress(props.getTarget().getUrl())));
 
             if (rounds.stream().anyMatch(r -> r.getFailed() > 0)) {
                 exit = 1;
@@ -175,7 +174,7 @@ public class DoEnvCliRunner implements ApplicationRunner {
                             res.tablesBefore(), res.tablesAfter(),
                             res.rounds(), res.remaining(),
                             res.env().blockers(), res.generatorErrors(),
-                            res.executedItems()));
+                            res.executedItems(), safeAddress(props.getCk().getUrl())));
 
                     if (res.rounds().stream().anyMatch(r -> r.getFailed() > 0)
                             || !res.generatorErrors().isEmpty()
@@ -186,23 +185,73 @@ public class DoEnvCliRunner implements ApplicationRunner {
             }
         }
 
-        // ────────── 结果文档：无论成败都出 ──────────
-        // 正文与 SQL 原文拆开：正文只留摘要表格，几十 KB 随时可开；
-        // 原文单独落 .sql 附录，排查时按序号检索
-        String appendixName = "升级SQL原文-" + stamp + ".sql";
-        String doc = UpgradeResultDocument.render(sections, appendixName);
-        Path docPath = dir.resolve("升级结果-" + stamp + ".txt");
-        Files.writeString(docPath, doc, StandardCharsets.UTF_8);
-
-        Path sqlPath = dir.resolve(appendixName);
-        Files.writeString(sqlPath, UpgradeResultDocument.renderSqlAppendix(sections),
-                StandardCharsets.UTF_8);
+        // ────────── 固定四文件结果：无论语句成功、失败或被拦下都能定位 ──────────
+        com.doenv.schema.service.UpgradeResultFiles.Bundle files =
+                com.doenv.schema.service.UpgradeResultFiles.render(sections);
+        Path summaryPath = dir.resolve("执行结果汇总.txt");
+        Path successPath = dir.resolve("sql-success.txt");
+        Path failedPath = dir.resolve("sql-failed.txt");
+        Path pendingPath = dir.resolve("待审核sql.txt");
+        writeResultFiles(dir, files);
 
         System.out.println();
-        System.out.println(doc);
-        log.info("###### 升级结果文档 {} ######", docPath.toAbsolutePath());
-        log.info("###### SQL 原文附录 {} ######", sqlPath.toAbsolutePath());
+        System.out.println(files.summary());
+        log.info("###### 执行结果汇总 {} ######", summaryPath.toAbsolutePath());
+        log.info("###### 成功 SQL {} ######", successPath.toAbsolutePath());
+        log.info("###### 失败 SQL {} ######", failedPath.toAbsolutePath());
+        log.info("###### 待审核 SQL {} ######", pendingPath.toAbsolutePath());
         return exit;
+    }
+
+    private void writeFatalResultFiles(Exception error) {
+        try {
+            Path dir = Path.of(outDir);
+            Files.createDirectories(dir);
+            writeResultFiles(dir,
+                    com.doenv.schema.service.UpgradeResultFiles.fatal(
+                            dbKind, configuredAddresses(), error));
+            log.error("已生成启动失败结果文件：{}", dir.toAbsolutePath());
+        } catch (Exception writeError) {
+            log.error("升级失败，且结果文件写入也失败", writeError);
+        }
+    }
+
+    private static void writeResultFiles(
+            Path dir, com.doenv.schema.service.UpgradeResultFiles.Bundle files) throws Exception {
+        Files.writeString(dir.resolve("执行结果汇总.txt"), files.summary(), StandardCharsets.UTF_8);
+        Files.writeString(dir.resolve("sql-success.txt"), files.successSql(), StandardCharsets.UTF_8);
+        Files.writeString(dir.resolve("sql-failed.txt"), files.failedSql(), StandardCharsets.UTF_8);
+        Files.writeString(dir.resolve("待审核sql.txt"), files.pendingSql(), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * 报告只展示连接主体：去掉 query/fragment，并遮蔽 URL user-info 中的密码。
+     */
+    static String safeAddress(String value) {
+        if (value == null || value.isBlank()) {
+            return "宿主DataSource（地址未显式配置）";
+        }
+        String address = value.trim();
+        int query = address.indexOf('?');
+        if (query >= 0) {
+            address = address.substring(0, query);
+        }
+        int fragment = address.indexOf('#');
+        if (fragment >= 0) {
+            address = address.substring(0, fragment);
+        }
+        return address.replaceAll("(//[^/@:]+):[^/@]+@", "$1:***@");
+    }
+
+    private String configuredAddresses() {
+        List<String> addresses = new java.util.ArrayList<>();
+        if ("pg".equalsIgnoreCase(dbKind) || "both".equalsIgnoreCase(dbKind)) {
+            addresses.add("PG=" + safeAddress(props.getTarget().getUrl()));
+        }
+        if ("ck".equalsIgnoreCase(dbKind) || "both".equalsIgnoreCase(dbKind)) {
+            addresses.add("CK=" + safeAddress(props.getCk().getUrl()));
+        }
+        return String.join("，", addresses);
     }
 
     /** 只比对模式下也要拿到 CK 的差异，用于结果文档的第二部分 */

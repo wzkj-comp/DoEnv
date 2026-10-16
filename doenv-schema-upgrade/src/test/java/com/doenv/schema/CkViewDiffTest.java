@@ -70,16 +70,19 @@ class CkViewDiffTest {
     }
 
     @Test
-    void 定义不同只报告不替换() {
+    void 普通视图定义不同自动覆盖为基准定义() {
         SchemaModel live = baseline();
         live.getViews().get(0).setQuery("SELECT * FROM vax_trans");
 
         DiffItem d = diff(baseline(), live).stream()
                 .filter(x -> x.getType() == DiffType.VIEW_DIFF)
                 .findFirst().orElseThrow();
-        assertEquals(DiffLevel.INFO, d.getLevel());
-        assertTrue(d.getDdl().isEmpty(),
-                "改视图是整体替换，会抹掉现场的调整，不能自动执行");
+        assertEquals(DiffLevel.AUTO, d.getLevel());
+        assertEquals(1, d.getDdl().size());
+        assertTrue(d.getDdl().get(0).startsWith("CREATE OR REPLACE VIEW `vax_trans_view`"),
+                d.getDdl().get(0));
+        assertTrue(d.getDdl().get(0).contains("SELECT * EXCEPT (transflag)"),
+                "必须使用纯净库定义覆盖现场视图");
     }
 
     @Test

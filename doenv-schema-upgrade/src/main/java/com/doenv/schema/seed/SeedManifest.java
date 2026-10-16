@@ -20,8 +20,7 @@ import java.util.Map;
  * <p>清单是<b>人工审校的 SSOT</b>，不自动生成 —— 每一条策略背后都是对
  * 「后端有没有运行时写路径、现场会不会改这一列」的取证结论。
  *
- * <p>未在清单里列出的表一律按 {@link SeedStrategy#STRUCTURE_ONLY} 处理：
- * 默认不下发数据，是安全的一侧。
+ * <p>未在清单里列出的、但纯净库带初始化数据的表使用 {@link #defaultRule}。
  */
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -31,6 +30,7 @@ public class SeedManifest {
 
     private String manifestVersion;
     private String note;
+    private SeedTableRule defaultRule;
     private List<SeedTableRule> tables = new ArrayList<>();
 
     private transient Map<String, SeedTableRule> index;
@@ -57,12 +57,33 @@ public class SeedManifest {
         if (r != null) {
             return r;
         }
-        // 兜底：清单没覆盖到的表默认不下发数据
-        SeedTableRule fallback = new SeedTableRule();
+        SeedTableRule fallback = copyRule(defaultRule);
         fallback.setTable(tableName);
-        fallback.setStrategy(SeedStrategy.STRUCTURE_ONLY);
-        fallback.setReason("未在 manifest 中登记，默认只做结构检查、不下发数据");
+        if (defaultRule == null) {
+            fallback.setStrategy(SeedStrategy.STRUCTURE_ONLY);
+            fallback.setReason("未在 manifest 中登记，默认只做结构检查、不下发数据");
+        }
         return fallback;
+    }
+
+    private static SeedTableRule copyRule(SeedTableRule source) {
+        SeedTableRule copy = new SeedTableRule();
+        if (source == null) {
+            return copy;
+        }
+        copy.setCategory(source.getCategory());
+        copy.setStrategy(source.getStrategy());
+        copy.setKey(new ArrayList<>(source.getKey()));
+        copy.setFreeze(new ArrayList<>(source.getFreeze()));
+        copy.setInsertMustSet(new ArrayList<>(source.getInsertMustSet()));
+        copy.setDeletePredicate(source.getDeletePredicate());
+        copy.setBaselineFilter(new LinkedHashMap<>(source.getBaselineFilter()));
+        copy.setKeyBlacklist(new ArrayList<>(source.getKeyBlacklist()));
+        copy.setDependsOn(new ArrayList<>(source.getDependsOn()));
+        copy.setRebuildCheckColumns(new ArrayList<>(source.getRebuildCheckColumns()));
+        copy.setPreserve(new ArrayList<>(source.getPreserve()));
+        copy.setReason(source.getReason());
+        return copy;
     }
 
     /** 按 dependsOn 做拓扑排序，父表排在子表前面 */

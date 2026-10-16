@@ -29,12 +29,32 @@ public final class GeneratedSqlValidator {
                 boolean rebuildWipe = i == 0
                         && d.getType() == com.doenv.schema.diff.DiffType.SEED_REBUILD
                         && u.trim().matches("DELETE FROM \\S+;");
+                boolean isColumnDrop = d.getType() == com.doenv.schema.diff.DiffType.COLUMN_DROP;
+                String expectedColumnDrop = isColumnDrop
+                        ? "ALTER TABLE " + SqlQuoter.table(schema, d.getTableName())
+                        + " DROP COLUMN IF EXISTS " + SqlQuoter.ident(d.getObjectName()) + ";"
+                        : "";
+                boolean approvedColumnDrop = isColumnDrop && sql.trim().equals(expectedColumnDrop);
+                boolean isColumnRename = d.getType()
+                        == com.doenv.schema.diff.DiffType.COLUMN_RENAME;
+                String expectedColumnRename = isColumnRename
+                        ? new PgDdlRenderer(schema).renameColumn(
+                                d.getTableName(), d.getLiveDef(), d.getObjectName())
+                        : "";
+                boolean approvedColumnRename = isColumnRename
+                        && sql.trim().equals(expectedColumnRename.trim());
 
                 if (u.contains("DROP TABLE")) {
                     errors.add(d.getKey() + "：出现 DROP TABLE");
                 }
-                if (u.contains("DROP COLUMN")) {
+                if (u.contains("DROP COLUMN") && !approvedColumnDrop) {
                     errors.add(d.getKey() + "：出现 DROP COLUMN");
+                }
+                if (approvedColumnDrop && u.contains("CASCADE")) {
+                    errors.add(d.getKey() + "：DROP COLUMN 禁止 CASCADE");
+                }
+                if (u.contains("RENAME COLUMN") && !approvedColumnRename) {
+                    errors.add(d.getKey() + "：RENAME COLUMN 与显式清单不一致");
                 }
                 if (u.contains("TRUNCATE")) {
                     errors.add(d.getKey() + "：出现 TRUNCATE");

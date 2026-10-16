@@ -1,0 +1,20 @@
+{
+  "manifestVersion": "1.0",
+  "note": "CK 初始化数据规则：已明确的 7 张系统配置表保持只补不改；后续新数据表默认按 id 补缺并更新，四个审计字段不覆盖；没有 id 则待审核。",
+  "defaultRule": {
+    "category": "CK_DATA",
+    "strategy": "MERGE_FREEZE",
+    "key": ["id"],
+    "freeze": ["creatorid", "createdtime", "lastupdatorid", "lastupdatedtime"],
+    "reason": "后续新数据表默认规则：按 id 补缺并更新差异列，四个审计字段保留现场值"
+  },
+  "tables": [
+    {"table": "dx_authorization_relationship", "strategy": "INSERT_ONLY", "key": ["id"]},
+    {"table": "dx_clean_keyword_conf", "strategy": "INSERT_ONLY", "key": ["id"]},
+    {"table": "dx_user_role", "strategy": "INSERT_ONLY", "key": ["id"]},
+    {"table": "dx_lab", "strategy": "INSERT_ONLY", "key": ["id"]},
+    {"table": "dx_lab_Member", "strategy": "INSERT_ONLY", "key": ["id"]},
+    {"table": "dx_user", "strategy": "INSERT_ONLY", "key": ["id"]},
+    {"table": "dx_user_role_relationship", "strategy": "INSERT_ONLY", "key": ["id"]}
+  ]
+}

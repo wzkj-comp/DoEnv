@@ -57,6 +57,12 @@ public class DataOConfigBridge implements EnvironmentPostProcessor {
             return;
         }
 
+        // Spring Boot 只扫「进程工作目录」的 application.properties，不是 jar 所在目录。
+        // 运维从别处执行 java -jar /opt/datao/doenv.jar 时，两者不是一回事，
+        // DataO 那份配置根本没进 env，最后报「找不到 DataSource」——
+        // 承诺的「放同级目录零参数运行」就落空了。这里主动补上 jar 同级那份。
+        loadSideCarProperties(env);
+
         Map<String, Object> m = new LinkedHashMap<>();
 
         // ── PG ──
@@ -100,6 +106,43 @@ public class DataOConfigBridge implements EnvironmentPostProcessor {
         env.getPropertySources().addFirst(new MapPropertySource(SOURCE_NAME, m));
         log.info("已桥接 DataO 数据源配置：PG=" + mask(pgUrl) + "，CK=" + mask(ckUrl));
 
+    }
+
+    /**
+     * 读 jar 同级目录的 {@code application.properties}（含 {@code config/} 子目录）。
+     *
+     * <p>Spring Boot 默认只找进程工作目录，而运维完全可能从别处执行
+     * {@code java -jar /opt/datao/doenv.jar}。工作目录那份（如果有）优先级更高，
+     * 这里用 {@code addLast} 挂在最后，只作为兜底，压不掉任何已有配置。
+     */
+    private void loadSideCarProperties(ConfigurableEnvironment env) {
+        // 已经能读到 DataO 的连接配置就不必再找
+        if (first(env, "spring.datasource.jdbc-url", "spring.datasource.url") != null) {
+            return;
+        }
+        java.nio.file.Path jarDir = com.doenv.schema.service.BaselineLocator.jarDirectory();
+        if (jarDir == null) {
+            return;
+        }
+        for (String rel : new String[]{"application.properties", "config/application.properties"}) {
+            java.nio.file.Path p = jarDir.resolve(rel);
+            if (!java.nio.file.Files.isRegularFile(p)) {
+                continue;
+            }
+            try (java.io.InputStream in = java.nio.file.Files.newInputStream(p)) {
+                java.util.Properties props = new java.util.Properties();
+                // DataO 的配置文件是 UTF-8；Properties 默认按 ISO-8859-1 读会毁掉中文注释里的值
+                props.load(new java.io.InputStreamReader(in, java.nio.charset.StandardCharsets.UTF_8));
+                Map<String, Object> src = new LinkedHashMap<>();
+                props.forEach((k, v) -> src.put(String.valueOf(k), v));
+                env.getPropertySources().addLast(
+                        new MapPropertySource("doenvJarSideCar:" + p, src));
+                log.info("已加载 jar 同级配置 " + p + "（" + src.size() + " 项）");
+                return;
+            } catch (Exception e) {
+                log.warn("读取 " + p + " 失败，跳过：" + e.getMessage());
+            }
+        }
     }
 
     /**

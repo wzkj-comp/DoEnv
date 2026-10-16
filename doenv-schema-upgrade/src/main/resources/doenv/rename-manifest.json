@@ -1,0 +1,19 @@
+{
+  "manifestVersion": "2026-09-01",
+  "note": "字段改名必须显式登记。命中后执行 RENAME COLUMN，并排除 ADD COLUMN + DROP COLUMN；新旧列同时存在时转人工。",
+  "pg": [],
+  "ck": [
+    {
+      "table": "KS_PARTICIPANT",
+      "from": "userid",
+      "to": "examineeid",
+      "reason": "2026-02-09 增量：参与者用户字段改为考生字段"
+    },
+    {
+      "table": "vax_address",
+      "from": "totalusdamount",
+      "to": "usdbalance",
+      "reason": "2026-06-17 增量：USDT 总金额字段改名"
+    }
+  ]
+}

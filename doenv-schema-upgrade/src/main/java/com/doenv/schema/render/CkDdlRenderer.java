@@ -181,6 +181,18 @@ public class CkDdlRenderer {
                 + CkTokens.ident(v.getName()) + onCluster() + "\nAS " + v.getQuery() + ";";
     }
 
+    /**
+     * 用基准定义覆盖普通视图。普通 View 不存储数据，替换仅更新查询定义；
+     * Materialized View 有落地数据，调用方不得走这条路径。
+     */
+    public String replaceView(com.doenv.schema.model.ViewModel v) {
+        if (v.isMaterialized()) {
+            throw new IllegalArgumentException("物化视图不能自动替换：" + v.getName());
+        }
+        return "CREATE OR REPLACE VIEW " + CkTokens.ident(v.getName()) + onCluster()
+                + "\nAS " + v.getQuery() + ";";
+    }
+
     /** 建表语句里的索引子句，与 ADD INDEX 共用同一份写法，避免两处漂移 */
     private static String indexDef(com.doenv.schema.model.CkIndexModel i) {
         return "INDEX " + CkTokens.ident(i.getName()) + " " + i.getExpression()
@@ -219,6 +231,17 @@ public class CkDdlRenderer {
         return out;
     }
 
+    /** 收尾迁移专用：只改表名，不删除原表；分布式下带 ON CLUSTER。 */
+    public String renameTable(String from, String to) {
+        return "RENAME TABLE " + CkTokens.ident(from) + " TO " + CkTokens.ident(to)
+                + onCluster() + ";";
+    }
+
+    /** 收尾迁移专用：临时 Distributed 路由表已不再使用时才删除。 */
+    public String dropTable(String table) {
+        return "DROP TABLE IF EXISTS " + CkTokens.ident(table) + onCluster() + ";";
+    }
+
     // ────────────────────────── 加列 ──────────────────────────
 
     /**
@@ -240,6 +263,18 @@ public class CkDdlRenderer {
         if (isDistributed()) {
             out.add("ALTER TABLE " + CkTokens.ident(table) + onCluster()
                     + " ADD COLUMN IF NOT EXISTS " + def + ";");
+        }
+        return out;
+    }
+
+    /** 显式字段改名；分布式下本地表与路由表成对执行。 */
+    public List<String> renameColumn(String table, String from, String to) {
+        List<String> out = new ArrayList<>();
+        String tail = " RENAME COLUMN IF EXISTS " + CkTokens.ident(from)
+                + " TO " + CkTokens.ident(to) + ";";
+        out.add("ALTER TABLE " + CkTokens.ident(localName(table)) + onCluster() + tail);
+        if (isDistributed()) {
+            out.add("ALTER TABLE " + CkTokens.ident(table) + onCluster() + tail);
         }
         return out;
     }
@@ -440,14 +475,34 @@ public class CkDdlRenderer {
     public static List<String> validateItems(List<com.doenv.schema.diff.DiffItem> items) {
         List<String> errors = new ArrayList<>();
         for (com.doenv.schema.diff.DiffItem d : items) {
-            boolean allowDrop = d.getType() == com.doenv.schema.diff.DiffType.CK_REBUILD_EMPTY;
+            boolean allowDrop = d.getType() == com.doenv.schema.diff.DiffType.CK_REBUILD_EMPTY
+                    || d.getType() == com.doenv.schema.diff.DiffType.FINAL_ITEM_LABEL_ENGINE_MIGRATION;
             for (String e : validate(d.getDdl(), allowDrop)) {
                 errors.add("[" + d.getType() + "/" + d.getTableName() + "] " + e);
             }
+            if (d.getType() == com.doenv.schema.diff.DiffType.FINAL_ITEM_LABEL_ENGINE_MIGRATION
+                    && d.getDdl().stream().anyMatch(sql -> sql.toUpperCase(Locale.ROOT).contains("DROP TABLE")
+                    && !sql.contains("`vax_item_label__doenv_new`"))) {
+                errors.add("[" + d.getTableName() + "] 收尾迁移只能删除临时表 vax_item_label__doenv_new");
+            }
             // 空表重建必须带行数探测，否则可能删掉有数据的表
-            if (allowDrop && d.getPrechecks().stream().noneMatch(
+            if (d.getType() == com.doenv.schema.diff.DiffType.CK_REBUILD_EMPTY
+                    && d.getPrechecks().stream().noneMatch(
                     r -> r.getExpect() == com.doenv.schema.diff.PrecheckRule.Expect.ZERO_COUNT)) {
                 errors.add("[" + d.getTableName() + "] 空表重建缺少行数探测，拒绝执行");
+            }
+            if (d.getType() == com.doenv.schema.diff.DiffType.COLUMN_RENAME) {
+                if (d.getDdl().isEmpty() || d.getDdl().size() > 2) {
+                    errors.add("[" + d.getTableName() + "] 字段改名语句数量异常");
+                }
+                for (String sql : d.getDdl()) {
+                    String u = sql.toUpperCase(Locale.ROOT);
+                    if (!u.contains("RENAME COLUMN IF EXISTS")
+                            || !sql.contains(CkTokens.ident(d.getObjectName()))) {
+                        errors.add("[" + d.getTableName() + "] 字段改名 SQL 与清单目标不一致："
+                                + head(sql));
+                    }
+                }
             }
         }
         return errors;

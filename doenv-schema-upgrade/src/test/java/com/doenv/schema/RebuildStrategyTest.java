@@ -102,6 +102,37 @@ class RebuildStrategyTest {
     }
 
     @Test
+    void 除四张强一致表外使用新的统一数据规则() throws Exception {
+        SeedManifest m = SeedManifest.loadDefault();
+
+        SeedTableRule caseConf = m.ruleFor("vao_case_table_field_conf");
+        assertEquals(SeedStrategy.MERGE_FREEZE, caseConf.getStrategy());
+        assertEquals(List.of("entitytypeid"), caseConf.getKey());
+        assertEquals(List.of("creatorid", "createdtime", "lastupdatorid", "lastupdatedtime"),
+                caseConf.getFreeze());
+
+        SeedTableRule futureChartConf = m.ruleFor("vao_entity_chart_conf");
+        assertEquals(List.of("entitytypeid"), futureChartConf.getKey(),
+                "当前纯净库没有初始化行，也必须提前登记未来数据规则");
+
+        SeedTableRule systemOpt = m.ruleFor("vao_system_opt");
+        assertEquals(SeedStrategy.INSERT_ONLY, systemOpt.getStrategy());
+        assertEquals(List.of("key"), systemOpt.getKey(), "vao_system_opt 物理上没有 id 列");
+
+        for (String table : List.of("vao_user", "vao_usergroup")) {
+            SeedTableRule rule = m.ruleFor(table);
+            assertEquals(SeedStrategy.INSERT_ONLY, rule.getStrategy(), table);
+            assertEquals(List.of("id"), rule.getKey(), table);
+        }
+
+        SeedTableRule fallback = m.ruleFor("vao_future_seed_table");
+        assertEquals(SeedStrategy.MERGE_FREEZE, fallback.getStrategy());
+        assertEquals(List.of("id"), fallback.getKey());
+        assertEquals(List.of("creatorid", "createdtime", "lastupdatorid", "lastupdatedtime"),
+                fallback.getFreeze());
+    }
+
+    @Test
     void 带count的表必须声明preserve() throws Exception {
         SeedManifest m = SeedManifest.loadDefault();
         for (String t : List.of("vao_entitytype", "vao_recordtype")) {

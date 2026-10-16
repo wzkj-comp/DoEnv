@@ -121,7 +121,7 @@ public class UpgradeExecutor {
                 StatementLog sl = newLog(++seq, item,
                         item.getDdl().isEmpty() ? "" : item.getDdl().get(0), false);
                 sl.setStatus("SKIPPED");
-                sl.setPfcVerdict("SKIP_PRECHECK_FAILED");
+                sl.setPfcVerdict(pre.error() ? "SKIP_PRECHECK_ERROR" : "SKIP_PRECHECK_FAILED");
                 sl.setError(pre.reason());
                 r.getStatements().add(sl);
                 tableChange(r, item.getTableName(), report).record(sl);
@@ -299,21 +299,25 @@ public class UpgradeExecutor {
     }
 
     /** 前置检查结论 */
-    private record PrecheckOutcome(boolean passed, String reason, List<String> infos) {
+    private record PrecheckOutcome(boolean passed, boolean error, String reason, List<String> infos) {
         static PrecheckOutcome ok(List<String> infos) {
-            return new PrecheckOutcome(true, null, infos);
+            return new PrecheckOutcome(true, false, null, infos);
         }
 
         static PrecheckOutcome fail(String reason) {
-            return new PrecheckOutcome(false, reason, List.of());
+            return new PrecheckOutcome(false, false, reason, List.of());
+        }
+
+        static PrecheckOutcome error(String reason) {
+            return new PrecheckOutcome(false, true, reason, List.of());
         }
     }
 
     /**
      * 逐条执行前置探测。任一不通过即整项不放行。
      *
-     * <p>探测本身出错（比如表还不存在）不算不通过 —— 那通常是同批里表还没建，
-     * 判成失败会误伤，交给后续执行时的真实报错去暴露。
+     * <p>探测本身出错必须 fail-close。前置检查保护的包含整表重建等破坏性操作，
+     * 不能因为超时、断连或权限问题就当成通过。
      */
     private PrecheckOutcome runPrechecks(DiffItem item) {
         if (item.getPrechecks().isEmpty()) {
@@ -357,7 +361,14 @@ public class UpgradeExecutor {
                     }
                 }
             } catch (RuntimeException e) {
-                infos.add(rule.getDescription() + "=探测失败(" + e.getClass().getSimpleName() + ")");
+                if (rule.getExpect() == PrecheckRule.Expect.INFO_ONLY) {
+                    infos.add(rule.getDescription() + "=信息采集失败("
+                            + e.getClass().getSimpleName() + ")");
+                    continue;
+                }
+                return PrecheckOutcome.error(rule.getDescription() + " 探测失败（"
+                        + e.getClass().getSimpleName() + "：" + nz(e.getMessage())
+                        + "），为保护现场数据已拒绝执行");
             }
         }
         return PrecheckOutcome.ok(infos);
@@ -372,6 +383,7 @@ public class UpgradeExecutor {
         sl.setSeq(seq);
         sl.setStartedAt(LocalDateTime.now().format(TS_MS));
         sl.setTable(item.getTableName());
+        sl.setObjectName(item.getObjectName());
         sl.setDiffType(item.getType().name());
         sl.setLevel(item.getLevel().name());
         sl.setAction(classify(sql));
@@ -415,11 +427,17 @@ public class UpgradeExecutor {
     /** 把 SQL 归类成人能读的动作名 */
     static String classify(String sql) {
         String u = sql.trim().toUpperCase(Locale.ROOT);
+        if (u.contains("RENAME COLUMN")) {
+            return "RENAME_COLUMN";
+        }
         if (u.startsWith("CREATE TABLE")) {
             return "CREATE_TABLE";
         }
         if (u.startsWith("ALTER TABLE") && u.contains("ADD COLUMN")) {
             return "ADD_COLUMN";
+        }
+        if (u.startsWith("ALTER TABLE") && u.contains("DROP COLUMN")) {
+            return "DROP_COLUMN";
         }
         if (u.startsWith("ALTER TABLE") && u.contains("ALTER COLUMN") && u.contains("TYPE")) {
             return "ALTER_TYPE";

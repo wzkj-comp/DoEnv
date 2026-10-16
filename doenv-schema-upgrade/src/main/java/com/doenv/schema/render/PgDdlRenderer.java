@@ -16,7 +16,7 @@ import java.util.stream.Collectors;
  * <ul>
  *   <li>表引用一律带 schema 限定符</li>
  *   <li>可重复执行（IF NOT EXISTS 或 DO $$ 守卫）</li>
- *   <li>不产生任何 DROP / TRUNCATE / 无 WHERE 的 DELETE</li>
+ *   <li>除明确的 PG 多余列删除外，不产生 DROP / TRUNCATE / 无 WHERE 的 DELETE</li>
  * </ul>
  */
 public class PgDdlRenderer {
@@ -98,6 +98,36 @@ public class PgDdlRenderer {
             sb.append(" DEFAULT ").append(c.getDefaultRaw());
         }
         return sb.append(';').toString();
+    }
+
+    /**
+     * 删除纯净库中不存在的现场列。刻意不带 CASCADE：如果有视图等外部依赖，
+     * 让 PostgreSQL 拒绝本项，而不是连带删除未知对象。
+     */
+    public String dropColumn(String table, String column) {
+        return "ALTER TABLE " + SqlQuoter.table(schema, table)
+                + " DROP COLUMN IF EXISTS " + SqlQuoter.ident(column) + ";";
+    }
+
+    /**
+     * 显式字段改名。PG 没有 RENAME COLUMN IF EXISTS，用 DO 块同时守住旧列存在、
+     * 新列不存在，重复执行不会报错，也绝不覆盖已存在的目标列。
+     */
+    public String renameColumn(String table, String from, String to) {
+        String body = "  IF EXISTS (SELECT 1 FROM information_schema.columns\n"
+                + "             WHERE table_schema = " + SqlQuoter.literal(schema)
+                + " AND table_name = " + SqlQuoter.literal(table)
+                + " AND column_name = " + SqlQuoter.literal(from) + ")\n"
+                + "     AND NOT EXISTS (SELECT 1 FROM information_schema.columns\n"
+                + "                 WHERE table_schema = " + SqlQuoter.literal(schema)
+                + " AND table_name = " + SqlQuoter.literal(table)
+                + " AND column_name = " + SqlQuoter.literal(to) + ")\n"
+                + "  THEN\n"
+                + "    ALTER TABLE " + SqlQuoter.table(schema, table)
+                + " RENAME COLUMN " + SqlQuoter.ident(from)
+                + " TO " + SqlQuoter.ident(to) + ";\n"
+                + "  END IF;";
+        return SqlQuoter.doBlock(body);
     }
 
     // ────────────────────────── 改列 ──────────────────────────

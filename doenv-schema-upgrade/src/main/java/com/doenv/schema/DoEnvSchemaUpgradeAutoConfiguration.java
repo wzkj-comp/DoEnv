@@ -64,8 +64,20 @@ public class DoEnvSchemaUpgradeAutoConfiguration {
         } else {
             ds = hostDataSource.getIfAvailable();
             if (ds == null) {
-                throw new IllegalStateException(
-                        "既没有配置 doenv.schema-upgrade.target.url，也找不到宿主的 DataSource");
+                // 现场最常见的一次失败就是这里：jar 没和 DataO 放同一目录，
+                // 或从别处执行导致工作目录不对，application.properties 压根没被读到。
+                // 光说「找不到 DataSource」不足以让运维自己解决，把出路一并列出。
+                throw new IllegalStateException(String.join("\n",
+                        "没有拿到 PostgreSQL 连接信息（既无 doenv.schema-upgrade.target.url，也无宿主 DataSource）。",
+                        "jar 所在目录：" + com.doenv.schema.service.BaselineLocator.jarDirectory(),
+                        "工作目录：" + java.nio.file.Paths.get("").toAbsolutePath(),
+                        "按以下任一方式解决：",
+                        "  1) 把 doenv.jar 放到 DataO 的 application.properties 同一目录，再执行；",
+                        "  2) 显式指定连接：",
+                        "     --doenv.schema-upgrade.target.url=jdbc:postgresql://IP:5432/datao",
+                        "     --doenv.schema-upgrade.target.username=xxx",
+                        "     --doenv.schema-upgrade.target.password=xxx",
+                        "  3) 只升级 ClickHouse，不碰 PG：--doenv.schema-upgrade.cli.db=ck"));
             }
         }
         return new JdbcTemplate(ds);

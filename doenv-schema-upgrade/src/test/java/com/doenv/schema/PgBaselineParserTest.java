@@ -93,10 +93,28 @@ class PgBaselineParserTest {
 
     @Test
     void 破坏性语句必须全部丢弃() {
-        // 基准原文含 DROP TABLE 与无 WHERE 的 DELETE FROM，一条都不能进模型
-        assertTrue(bundle.getDiscarded().getOrDefault("DROP_TABLE", 0) > 0, "应丢弃 DROP TABLE");
-        assertTrue(bundle.getDiscarded().getOrDefault("UNSAFE_DELETE", 0) > 0, "应丢弃无 WHERE 的 DELETE");
-        assertTrue(bundle.getDiscarded().getOrDefault("OWNER_TO", 0) > 0, "应丢弃 OWNER TO");
+        // 新导出器按空库安装契约不再生成这些语句；这里用合成输入钉住解析器的安全边界。
+        BaselineBundle dangerous = new PgBaselineParser().parse("""
+                DROP TABLE public.t;
+                DELETE FROM public.t;
+                ALTER TABLE public.t OWNER TO datao;
+                """, "test", "test.sql");
+        assertEquals(1, dangerous.getDiscarded().getOrDefault("DROP_TABLE", 0));
+        assertEquals(1, dangerous.getDiscarded().getOrDefault("UNSAFE_DELETE", 0));
+        assertEquals(1, dangerous.getDiscarded().getOrDefault("OWNER_TO", 0));
+    }
+
+    @Test
+    void 幂等DO约束与regclass序列状态必须完整解析() {
+        assertEquals(0, bundle.getDiscarded().getOrDefault("DO_UNPARSED", 0));
+        assertEquals(0, bundle.getDiscarded().getOrDefault("SETVAL_UNPARSED", 0));
+
+        long constraints = bundle.getSchema().getTables().stream()
+                .mapToLong(t -> t.getConstraints().size()).sum();
+        assertTrue(constraints >= 60, "08-13 基准应完整解析 60 条约束，实际=" + constraints);
+        assertEquals(4, bundle.getSchema().getSequences().size());
+        bundle.getSchema().getSequences().forEach(s -> assertNotNull(s.getLastValue(),
+                "序列状态未从 setval 解析：" + s.getName()));
     }
 
     @Test
@@ -191,8 +209,10 @@ class PgBaselineParserTest {
         SeedTable item = bundle.getSeeds().get("vao_lab_verify_config_item");
         assertNotNull(category, "vao_lab_verify_config_category 的手工 INSERT 未被解析");
         assertNotNull(item, "vao_lab_verify_config_item 的手工 INSERT 未被解析");
-        assertEquals(1, category.getRowCount());
-        assertEquals(7, item.getRowCount());
+        // 纯净库可继续补充这两张表的基准数据；这里验证的是无引号 INSERT 能被读取，
+        // 不能把某个历史版本的总行数写死。
+        assertTrue(category.getRowCount() >= 1);
+        assertTrue(item.getRowCount() >= 7);
 
         // e'...' 里的换行必须被还原成真实换行，而不是留下字面的 \n
         boolean hasRealNewline = item.getRows().stream()

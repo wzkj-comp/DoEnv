@@ -79,7 +79,7 @@ public class CkUpgradeExecutor {
             if (!pre.passed()) {
                 StatementLog sl = newLog(++seq, item, item.getDdl().get(0));
                 sl.setStatus("SKIPPED");
-                sl.setPfcVerdict("SKIP_PRECHECK_FAILED");
+                sl.setPfcVerdict(pre.error() ? "SKIP_PRECHECK_ERROR" : "SKIP_PRECHECK_FAILED");
                 sl.setError(pre.reason());
                 r.getStatements().add(sl);
                 tableChange(r, item.getTableName()).record(sl);
@@ -143,6 +143,15 @@ public class CkUpgradeExecutor {
                 st.execute(stripTrailingSemicolon(sl.getSql()));
                 sl.setStatus("OK");
             }
+            // 老版 ClickHouse JDBC 对 INSERT 常返回 -1，不能靠 getUpdateCount。
+            // 配置数据 INSERT 由本工具生成标准 VALUES 列表，直接数顶层 tuple，
+            // 才能在升级首页准确显示本次补了多少行数据。
+            if ("INSERT".equals(sl.getAction())) {
+                sl.setRowsAffected(countInsertRows(sl.getSql()));
+            } else if ("UPDATE".equals(sl.getAction())) {
+                // CK mutation JDBC 不返回可靠影响行数；工具按一个 id 生成一条 UPDATE。
+                sl.setRowsAffected(1);
+            }
         } catch (SQLException e) {
             sl.setStatus("FAILED");
             sl.setError("[" + e.getErrorCode() + "] " + firstLine(e.getMessage()));
@@ -151,6 +160,47 @@ public class CkUpgradeExecutor {
             sl.setError(e.getClass().getSimpleName() + ": " + firstLine(e.getMessage()));
         }
         sl.setCostMs(System.currentTimeMillis() - t);
+    }
+
+    /** 统计 INSERT ... VALUES 中的顶层 tuple，正确跳过字符串、数组和函数括号。 */
+    static int countInsertRows(String sql) {
+        String upper = sql.toUpperCase(Locale.ROOT);
+        int valuesAt = upper.indexOf("VALUES");
+        if (valuesAt < 0) {
+            return -1;
+        }
+        int count = 0;
+        int depth = 0;
+        for (int i = valuesAt + "VALUES".length(); i < sql.length(); i++) {
+            char c = sql.charAt(i);
+            if (c == '\'' || c == '"' || c == '`') {
+                char quote = c;
+                for (i++; i < sql.length(); i++) {
+                    char q = sql.charAt(i);
+                    if (q == '\\' && quote == '\'' && i + 1 < sql.length()) {
+                        i++;
+                        continue;
+                    }
+                    if (q == quote) {
+                        if (i + 1 < sql.length() && sql.charAt(i + 1) == quote) {
+                            i++;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (c == '(') {
+                if (depth == 0) {
+                    count++;
+                }
+                depth++;
+            } else if (c == ')' && depth > 0) {
+                depth--;
+            }
+        }
+        return count;
     }
 
     /** 回读校验：ON CLUSTER 返回不代表已生效 */
@@ -175,6 +225,16 @@ public class CkUpgradeExecutor {
                                 item.getTableName(), item.getObjectName());
                     }
                 }
+                case COLUMN_RENAME -> {
+                    Integer n = jdbc.queryForObject(
+                            "SELECT count() FROM system.columns WHERE database=currentDatabase() "
+                                    + "AND table = ? AND name = ?", Integer.class,
+                            localName(item.getTableName()), item.getObjectName());
+                    if (n == null || n == 0) {
+                        log.warn("回读校验失败：{}.{} 改名语句已返回但目标列不存在",
+                                item.getTableName(), item.getObjectName());
+                    }
+                }
                 default -> {
                 }
             }
@@ -189,13 +249,17 @@ public class CkUpgradeExecutor {
 
     // ────────────────────────── 前置探测 ──────────────────────────
 
-    private record PrecheckOutcome(boolean passed, String reason) {
+    private record PrecheckOutcome(boolean passed, boolean error, String reason) {
         static PrecheckOutcome ok() {
-            return new PrecheckOutcome(true, null);
+            return new PrecheckOutcome(true, false, null);
         }
 
         static PrecheckOutcome fail(String reason) {
-            return new PrecheckOutcome(false, reason);
+            return new PrecheckOutcome(false, false, reason);
+        }
+
+        static PrecheckOutcome error(String reason) {
+            return new PrecheckOutcome(false, true, reason);
         }
     }
 
@@ -221,8 +285,13 @@ public class CkUpgradeExecutor {
                     }
                 }
             } catch (RuntimeException e) {
-                // system.zookeeper 在单机上不可用之类，探测本身失败不算不通过
-                log.debug("探测跳过（{}）：{}", rule.getDescription(), e.getMessage());
+                if (rule.getExpect() == PrecheckRule.Expect.INFO_ONLY) {
+                    log.debug("信息采集跳过（{}）：{}", rule.getDescription(), e.getMessage());
+                    continue;
+                }
+                return PrecheckOutcome.error(rule.getDescription() + " 探测失败（"
+                        + e.getClass().getSimpleName() + "：" + nz(e.getMessage())
+                        + "），为保护现场数据已拒绝执行");
             }
         }
         return PrecheckOutcome.ok();
@@ -235,6 +304,7 @@ public class CkUpgradeExecutor {
         sl.setSeq(seq);
         sl.setStartedAt(LocalDateTime.now().format(TS_MS));
         sl.setTable(item.getTableName());
+        sl.setObjectName(item.getObjectName());
         sl.setDiffType(item.getType().name());
         sl.setLevel(item.getLevel().name());
         sl.setAction(classify(sql));
@@ -269,6 +339,9 @@ public class CkUpgradeExecutor {
         if (u.contains("ADD COLUMN")) {
             return "ADD_COLUMN";
         }
+        if (u.contains("RENAME COLUMN")) {
+            return "RENAME_COLUMN";
+        }
         if (u.contains("MODIFY COLUMN")) {
             return "MODIFY_COLUMN";
         }
@@ -280,6 +353,9 @@ public class CkUpgradeExecutor {
         }
         if (u.contains("ADD INDEX")) {
             return "ADD_INDEX";
+        }
+        if (u.contains(" UPDATE ") && u.contains(" WHERE ")) {
+            return "UPDATE";
         }
         return "OTHER";
     }

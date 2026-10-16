@@ -29,6 +29,9 @@
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <lombok.version>1.18.36</lombok.version>
+        <!-- 与本次内置纯净库日期一致；最终可执行包输出为 DoEnv20260929.jar -->
+        <doenv.baseline.date>20260929</doenv.baseline.date>
+        <doenv.baseline.iso-date>2026-09-29</doenv.baseline.iso-date>
     </properties>
 
     <build>

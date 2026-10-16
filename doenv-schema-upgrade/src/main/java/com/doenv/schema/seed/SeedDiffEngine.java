@@ -41,7 +41,16 @@ public class SeedDiffEngine {
     public List<DiffItem> diff(Map<String, SeedTable> baselineSeeds, SchemaModel live) {
         List<DiffItem> out = new ArrayList<>();
 
-        for (SeedTableRule rule : manifest.inDependencyOrder()) {
+        List<SeedTableRule> rules = new ArrayList<>(manifest.inDependencyOrder());
+        Set<String> declared = new LinkedHashSet<>();
+        rules.forEach(r -> declared.add(r.getTable().toLowerCase(Locale.ROOT)));
+        baselineSeeds.keySet().stream()
+                .filter(t -> !declared.contains(t.toLowerCase(Locale.ROOT)))
+                .sorted(String.CASE_INSENSITIVE_ORDER)
+                .map(manifest::ruleFor)
+                .forEach(rules::add);
+
+        for (SeedTableRule rule : rules) {
             SeedTable seed = baselineSeeds.get(rule.getTable().toLowerCase(Locale.ROOT));
             if (seed == null || seed.getRowCount() == 0) {
                 continue;
@@ -50,6 +59,12 @@ public class SeedDiffEngine {
                 out.add(DiffItem.of(DiffType.SEED_ROW_MISSING, DiffLevel.INFO, rule.getTable(), null)
                         .note("策略 STRUCTURE_ONLY：基准有 " + seed.getRowCount()
                                 + " 行，按规则不下发。" + nz(rule.getReason())));
+                continue;
+            }
+            seed = filterBaselineRows(seed, rule);
+            if (seed.getRowCount() == 0) {
+                out.add(DiffItem.of(DiffType.SEED_ROW_DIFF, DiffLevel.INFO, rule.getTable(), null)
+                        .note("基准数据经 baselineFilter 过滤后为 0 行，不执行数据更新"));
                 continue;
             }
             TableModel lt = live.findTable(rule.getTable());
@@ -95,6 +110,15 @@ public class SeedDiffEngine {
         if (rule.getKey().isEmpty()) {
             out.add(DiffItem.of(DiffType.SEED_ROW_MISSING, DiffLevel.MANUAL, table, null)
                     .note("未配置稳定键，无法安全比对，已跳过"));
+            return;
+        }
+        List<String> missingKeyColumns = rule.getKey().stream()
+                .filter(k -> seed.getColumns().stream().noneMatch(c -> c.equalsIgnoreCase(k)))
+                .toList();
+        if (!missingKeyColumns.isEmpty()) {
+            out.add(DiffItem.of(DiffType.SEED_ROW_MISSING, DiffLevel.MANUAL, table, null)
+                    .note("数据规则指定的稳定键在纯净库中不存在："
+                            + String.join(", ", missingKeyColumns) + "，已跳过"));
             return;
         }
 
@@ -192,7 +216,7 @@ public class SeedDiffEngine {
         }
         Map<String, Map<String, String>> liveRows;
         try {
-            liveRows = loadLiveRows(table, seed, rule);
+            liveRows = loadLiveRows(table, seed, rule, rule.getDeletePredicate());
         } catch (RuntimeException e) {
             return false;
         }
@@ -240,7 +264,7 @@ public class SeedDiffEngine {
         jdbc.query(sql, rs -> {
             Map<String, String> row = new LinkedHashMap<>();
             for (String k : rule.getKey()) {
-                row.put(k, rs.getString(k));
+                row.put(k, jdbcText(rs.getObject(k), rs.getString(k)));
             }
             dup.add(keyOf(row, rule.getKey()));
         });
@@ -386,7 +410,7 @@ public class SeedDiffEngine {
         jdbc.query(sql, rs -> {
             Map<String, String> row = new LinkedHashMap<>();
             for (String c : seed.getColumns()) {
-                row.put(c, rs.getString(c));
+                row.put(c, jdbcText(rs.getObject(c), rs.getString(c)));
             }
             String id = rs.getString("id");
             if (id != null) {
@@ -403,21 +427,70 @@ public class SeedDiffEngine {
 
     private Map<String, Map<String, String>> loadLiveRows(String table, SeedTable seed,
                                                           SeedTableRule rule) {
+        return loadLiveRows(table, seed, rule, null);
+    }
+
+    private Map<String, Map<String, String>> loadLiveRows(String table, SeedTable seed,
+                                                          SeedTableRule rule, String where) {
         String sql = renderer.selectByKeys(table, seed.getColumns(), rule.getKey());
+        if (where != null && !where.isBlank()) {
+            sql += " WHERE " + where;
+        }
         Map<String, Map<String, String>> map = new LinkedHashMap<>();
         jdbc.query(sql, rs -> {
             Map<String, String> row = new LinkedHashMap<>();
             for (String c : seed.getColumns()) {
-                row.put(c, rs.getString(c));
+                row.put(c, jdbcText(rs.getObject(c), rs.getString(c)));
             }
             for (String k : rule.getKey()) {
                 if (!row.containsKey(k)) {
-                    row.put(k, rs.getString(k));
+                    row.put(k, jdbcText(rs.getObject(k), rs.getString(k)));
                 }
             }
             map.put(keyOf(row, rule.getKey()), row);
         });
         return map;
+    }
+
+    /**
+     * PostgreSQL JDBC 的 boolean {@code getString()} 返回 t/f，而纯净库 SQL 解析值是
+     * true/false。只针对驱动明确返回 Boolean 的列改写，文本列里的 "t"/"true"
+     * 保持原义，避免类型无关的宽松归一掩盖真实差异。
+     */
+    static String jdbcText(Object typedValue, String jdbcString) {
+        return typedValue instanceof Boolean b ? Boolean.toString(b) : jdbcString;
+    }
+
+    /** 按 manifest 过滤纯净库行；纯净库文件本身仍保留完整快照。 */
+    private SeedTable filterBaselineRows(SeedTable source, SeedTableRule rule) {
+        if (rule.getBaselineFilter().isEmpty()) {
+            return source;
+        }
+        SeedTable filtered = new SeedTable();
+        filtered.setTableName(source.getTableName());
+        filtered.setColumns(new ArrayList<>(source.getColumns()));
+        for (int i = 0; i < source.getRows().size(); i++) {
+            Map<String, String> row = source.getRows().get(i);
+            boolean matches = rule.getBaselineFilter().entrySet().stream()
+                    .allMatch(e -> Objects.equals(e.getValue(), valueIgnoreCase(row, e.getKey())));
+            if (!matches) {
+                continue;
+            }
+            List<String> values = filtered.getColumns().stream().map(row::get).toList();
+            Map<String, String> raw = source.rawRow(i);
+            List<String> rawValues = filtered.getColumns().stream().map(raw::get).toList();
+            filtered.addRow(values, rawValues);
+        }
+        return filtered;
+    }
+
+    private static String valueIgnoreCase(Map<String, String> row, String column) {
+        for (Map.Entry<String, String> e : row.entrySet()) {
+            if (e.getKey().equalsIgnoreCase(column)) {
+                return e.getValue();
+            }
+        }
+        return null;
     }
 
     private boolean isBlacklisted(Map<String, String> row, SeedTableRule rule) {

@@ -116,7 +116,7 @@ public final class CkUpgradeReportRenderer {
             }
             sb.append('\n');
             sb.append("  这些表的引擎/分区键/排序键/主键在 CK 里建表后不可 ALTER，\n");
-            sb.append("  重建会丢数据，因此工具不动它们。迁移模板已随差异项生成，需人工执行。\n");
+            sb.append("  表已有数据，工具已跳过且不生成解决方案 SQL。\n");
         }
 
         // ── 四、只读提示 ──

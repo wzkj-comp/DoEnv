@@ -5,6 +5,8 @@ import com.doenv.schema.model.ColumnModel;
 import com.doenv.schema.model.SchemaModel;
 import com.doenv.schema.model.TableModel;
 import com.doenv.schema.render.CkDdlRenderer;
+import com.doenv.schema.rename.ColumnRenameRule;
+import com.doenv.schema.rename.ColumnRenameRules;
 
 import com.doenv.schema.model.CkIndexModel;
 import java.util.LinkedHashMap;
@@ -25,8 +27,8 @@ import java.util.Set;
  *       现场是 {@code CaseID} 而基准是 {@code caseid} 时会<b>真的加出第二个列</b>，
  *       不报错、不丢数据，但分片键可能指向空列。所以只做精确匹配，
  *       忽略大小写命中一律判 MANUAL</li>
- *   <li><b>引擎 / 分区键 / 排序键 / 主键不可 ALTER</b>：只能新表 + INSERT SELECT + RENAME，
- *       一律 MANUAL 并出迁移模板</li>
+ *   <li><b>引擎 / 分区键 / 排序键 / 主键不可 ALTER</b>：一律 MANUAL，
+ *       只记录跳过原因，不生成迁移 SQL</li>
  *   <li><b>建 Replicated 表要防 ZK 残留</b>：IF NOT EXISTS 挡不住 Code 342</li>
  * </ul>
  */
@@ -40,14 +42,21 @@ public class CkSchemaDiffEngine {
 
     private final CkDdlRenderer renderer;
     private final TableRowCounter rowCounter;
+    private final List<ColumnRenameRule> renameRules;
 
     public CkSchemaDiffEngine(CkDdlRenderer renderer) {
-        this(renderer, t -> -1L);
+        this(renderer, t -> -1L, List.of());
     }
 
     public CkSchemaDiffEngine(CkDdlRenderer renderer, TableRowCounter rowCounter) {
+        this(renderer, rowCounter, List.of());
+    }
+
+    public CkSchemaDiffEngine(CkDdlRenderer renderer, TableRowCounter rowCounter,
+                              List<ColumnRenameRule> renameRules) {
         this.renderer = renderer;
         this.rowCounter = rowCounter == null ? t -> -1L : rowCounter;
+        this.renameRules = renameRules == null ? List.of() : List.copyOf(renameRules);
     }
 
     public List<DiffItem> diff(SchemaModel baseline, SchemaModel live, DiffOptions opt) {
@@ -100,8 +109,8 @@ public class CkSchemaDiffEngine {
     /**
      * 比对视图。<b>只补不删</b>：基准有而现场没有就建，现场多出的不动。
      *
-     * <p>同名但定义不同的只报告 —— 改视图等于 {@code CREATE OR REPLACE}，
-     * 是整体覆盖，会把现场对视图的调整无声抹掉，和「只补不删」是一个道理。
+     * <p>普通视图不存储数据，同名但定义不同就以纯净库为准自动替换；
+     * Materialized View 有落地数据，仍绝不自动重建或覆盖。
      */
     private void diffViews(SchemaModel baseline, SchemaModel live, DiffOptions opt,
                            List<DiffItem> out) {
@@ -122,10 +131,11 @@ public class CkSchemaDiffEngine {
                 continue;
             }
             if (!bv.normalizedQuery().equals(lv.normalizedQuery())) {
-                DiffItem d = DiffItem.of(DiffType.VIEW_DIFF, DiffLevel.INFO, bv.getName(), null);
+                DiffItem d = DiffItem.of(DiffType.VIEW_DIFF, DiffLevel.AUTO, bv.getName(), null);
                 d.setBaselineDef(head(bv.getQuery()));
                 d.setLiveDef(head(lv.getQuery()));
-                d.note("视图定义与基准不同。改视图是整体替换，会抹掉现场的调整，只报告不处理");
+                d.sql(renderer.replaceView(bv));
+                d.note("普通视图定义与基准不同：不涉及表数据，使用 CREATE OR REPLACE VIEW 对齐");
                 out.add(d);
             }
         }
@@ -247,6 +257,43 @@ public class CkSchemaDiffEngine {
 
         for (ColumnModel bc : bt.getColumns()) {
             ColumnModel lc = findExactColumn(lt, bc.getName());
+            ColumnRenameRule rename = ColumnRenameRules.byTarget(
+                    renameRules, bt.getName(), bc.getName());
+            ColumnModel old = rename == null ? null : findExactColumn(lt, rename.getFrom());
+
+            if (old != null) {
+                matched.add(old.getName());
+                if (lc != null) {
+                    matched.add(lc.getName());
+                    if (findExactColumn(bt, rename.getFrom()) != null) {
+                        diffOneColumn(bt, bc, lc, opt, out);
+                        continue;
+                    }
+                    out.add(DiffItem.of(DiffType.COLUMN_RENAME_CONFLICT, DiffLevel.MANUAL,
+                                    bt.getName(), bc.getName())
+                            .note("rename 清单要求 " + rename.getFrom() + " → " + rename.getTo()
+                                    + "，但现场新旧列同时存在。为避免覆盖数据，禁止自动改名"));
+                    diffOneColumn(bt, bc, lc, opt, out);
+                    continue;
+                }
+
+                DiffItem d = DiffItem.of(DiffType.COLUMN_RENAME, DiffLevel.CONFIRM,
+                        bt.getName(), bc.getName());
+                d.setLiveDef(rename.getFrom());
+                d.setBaselineDef(rename.getTo());
+                renderer.renameColumn(bt.getName(), rename.getFrom(), rename.getTo())
+                        .forEach(d::sql);
+                d.note("按 rename 清单改名，保留原列数据"
+                        + (rename.getReason() == null || rename.getReason().isBlank()
+                        ? "" : "：" + rename.getReason()));
+                if (renderer.isDistributed()) {
+                    d.note("分布式：本地表与路由表各一条，必须成对执行");
+                }
+                out.add(d);
+                diffOneColumn(bt, bc, old, opt, out);
+                continue;
+            }
+
             if (lc == null) {
                 ColumnModel ci = findColumnIgnoreCase(lt, bc.getName());
                 if (ci != null) {
@@ -276,6 +323,15 @@ public class CkSchemaDiffEngine {
         if (opt.isReportExtra()) {
             for (ColumnModel lc : lt.getColumns()) {
                 if (!matched.contains(lc.getName())) {
+                    ColumnRenameRule stale = ColumnRenameRules.bySource(
+                            renameRules, bt.getName(), lc.getName());
+                    if (stale != null) {
+                        out.add(DiffItem.of(DiffType.COLUMN_RENAME_CONFLICT, DiffLevel.MANUAL,
+                                        bt.getName(), stale.getTo())
+                                .note("rename 清单登记了 " + stale.getFrom() + " → " + stale.getTo()
+                                        + "，但目标列不在当前纯净库表结构中。保留旧列，需修正清单"));
+                        continue;
+                    }
                     out.add(DiffItem.of(DiffType.COLUMN_EXTRA, DiffLevel.INFO,
                                     bt.getName(), lc.getName())
                             .note("现场多出的列，只报告不处理"));
@@ -302,13 +358,12 @@ public class CkSchemaDiffEngine {
             DiffItem d = DiffItem.of(DiffType.TYPE_WIDEN_HEAVY, level, table, bc.getName());
             d.setLiveDef(lc.getRawType());
             d.setBaselineDef(bc.getRawType());
-            renderer.modifyColumn(table, bc).forEach(d::sql);
             d.precheck(PrecheckRule.info(renderer.precheckRowCount(table), "表行数"));
 
             if (onKey) {
-                d.note("该列在排序键/分区键/主键中，CK 会拒绝 ALTER（Trying to ALTER key column），"
-                        + "只能新表迁移");
+                d.note("该列在排序键/分区键/主键中，CK 无法直接修改，已跳过");
             } else {
+                renderer.modifyColumn(table, bc).forEach(d::sql);
                 d.note("CK 改类型要重写该列所有 part，大表是小时级且需额外磁盘");
             }
             out.add(d);
@@ -328,7 +383,7 @@ public class CkSchemaDiffEngine {
 
     // ────────────────────────── 引擎层 ──────────────────────────
 
-    /** 引擎 / 分区键 / 排序键 / 主键差异 —— CK 建表后改不了，一律 MANUAL 并出迁移模板 */
+    /** 引擎 / 分区键 / 排序键 / 主键差异 —— CK 建表后改不了，一律 MANUAL，只记录原因 */
     private void diffEngineLevel(TableModel bt, TableModel lt, List<DiffItem> out) {
         CkTableModel b = bt.getCk();
         CkTableModel l = lt.getCk();
@@ -367,8 +422,7 @@ public class CkSchemaDiffEngine {
             d.note("跳过原因：表有数据（" + rows + " 行），重建会丢数据");
         }
         d.note("变更项：" + changed);
-        d.note("CK 的引擎/分区键/排序键/主键建表后不可 ALTER，只能新表 + INSERT SELECT + RENAME");
-        d.sql(migrationTemplate(bt, lt));
+        d.note("CK 的引擎/分区键/排序键/主键建表后不可 ALTER，已跳过");
         out.add(d);
     }
 
@@ -397,29 +451,6 @@ public class CkSchemaDiffEngine {
 
     private static String orNone(String s) {
         return (s == null || s.isEmpty()) ? "(无)" : s;
-    }
-
-    /** 四步迁移模板。只出文本供人工执行，界面不给执行按钮 */
-    private String migrationTemplate(TableModel bt, TableModel lt) {
-        String t = bt.getName();
-        CkTableModel b = bt.getCk();
-        CkTableModel l = lt.getCk();
-        StringBuilder sb = new StringBuilder();
-        sb.append("-- 人工执行。ClickHouse 不支持 ALTER MODIFY PARTITION BY，ORDER BY 只能末尾追加列。\n");
-        sb.append("-- 现场: ").append(l == null ? "?" : l.immutableSignature()).append('\n');
-        sb.append("-- 基准: ").append(b == null ? "?" : b.immutableSignature()).append('\n');
-        sb.append("-- 1) 按基准定义建新表\n");
-        renderer.createTable(bt).forEach(s ->
-                sb.append(s.replace(t, t + "_new")).append('\n'));
-        sb.append("-- 2) 灌数据（有 caseid 的按 caseid 分批，避免一次性内存爆）\n");
-        sb.append("INSERT INTO ").append(t).append("_new SELECT <逐列对齐> FROM ").append(t).append(";\n");
-        sb.append("-- 3) 校验行数\n");
-        sb.append("SELECT (SELECT count() FROM ").append(t).append(") AS old_cnt, ")
-                .append("(SELECT count() FROM ").append(t).append("_new) AS new_cnt;\n");
-        sb.append("-- 4) 行数一致后切换\n");
-        sb.append("RENAME TABLE ").append(t).append(" TO ").append(t).append("_bak, ")
-                .append(t).append("_new TO ").append(t).append(";\n");
-        return sb.toString();
     }
 
     private void diffTableComment(TableModel bt, TableModel lt, List<DiffItem> out) {

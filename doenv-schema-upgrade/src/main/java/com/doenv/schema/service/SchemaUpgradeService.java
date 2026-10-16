@@ -5,11 +5,14 @@ import com.doenv.schema.baseline.PgBaselineParser;
 import com.doenv.schema.config.SchemaUpgradeProperties;
 import com.doenv.schema.diff.DiffItem;
 import com.doenv.schema.diff.DiffOptions;
+import com.doenv.schema.diff.FinalCheckDiffEngine;
 import com.doenv.schema.diff.SchemaDiffEngine;
 import com.doenv.schema.live.PgLiveSchemaReader;
 import com.doenv.schema.model.SchemaModel;
+import com.doenv.schema.model.TableModel;
 import com.doenv.schema.render.GeneratedSqlValidator;
 import com.doenv.schema.render.PgDdlRenderer;
+import com.doenv.schema.rename.RenameManifest;
 import com.doenv.schema.render.SeedSqlRenderer;
 import com.doenv.schema.seed.SeedDiffEngine;
 import com.doenv.schema.seed.SeedManifest;
@@ -134,9 +137,11 @@ public class SchemaUpgradeService {
         r.setLiveTables(live.getTableCount());
         r.setLiveColumns(live.getColumnCount());
 
+        RenameManifest renameManifest = loadRenameManifest(r);
         PgDdlRenderer ddl = new PgDdlRenderer(r.getSchema());
         DiffOptions opt = options == null ? new DiffOptions() : options;
-        r.setStructureDiffs(new SchemaDiffEngine(ddl).diff(baseline.getSchema(), live, opt));
+        r.setStructureDiffs(new SchemaDiffEngine(ddl, renameManifest.getPg())
+                .diff(baseline.getSchema(), live, opt));
 
         try {
             SeedManifest manifest = loadManifest();
@@ -148,6 +153,12 @@ public class SchemaUpgradeService {
             r.getGeneratorErrors().add("配置数据比对失败：" + e.getMessage());
         }
 
+        // 收尾检查必须排在普通结构/配置数据之后：本轮若刚补上 vao_user 或 systemauths，
+        // 下一轮会自然进入这里，避免在字段不存在时直接 UPDATE 报错。
+        TableModel liveUser = live.findTable(FinalCheckDiffEngine.SYSTEMAUTHS_TABLE);
+        Long nullRows = countSystemauthsNulls(r.getSchema(), liveUser);
+        r.getSeedDiffs().add(FinalCheckDiffEngine.systemauths(r.getSchema(), liveUser, nullRows));
+
         List<DiffItem> all = r.allDiffs();
         r.getGeneratorErrors().addAll(GeneratedSqlValidator.validate(all, r.getSchema()));
 
@@ -156,6 +167,20 @@ public class SchemaUpgradeService {
                 r.getReportId(), r.getStructureDiffs().size(), r.getSeedDiffs().size(),
                 r.getBlockers().size(), r.getGeneratorErrors().size());
         return r;
+    }
+
+    private Long countSystemauthsNulls(String schema, TableModel liveUser) {
+        if (liveUser == null || liveUser.findColumn("systemauths") == null) {
+            return 0L;
+        }
+        try {
+            Long n = jdbc.queryForObject("SELECT count(*) FROM \"" + schema.replace("\"", "\"\"")
+                    + "\".\"vao_user\" WHERE \"systemauths\" IS NULL", Long.class);
+            return n == null ? 0L : n;
+        } catch (RuntimeException e) {
+            log.warn("收尾检查 systemauths 空值探测失败，按安全原则不生成 UPDATE：{}", e.getMessage());
+            return null;
+        }
     }
 
     private synchronized void cacheReport(UpgradeReport r) {
@@ -359,5 +384,16 @@ public class SchemaUpgradeService {
             return empty;
         }
         return SeedManifest.load(res);
+    }
+
+    private RenameManifest loadRenameManifest(UpgradeReport report) {
+        try {
+            RenameManifest manifest = RenameManifest.loadDefault();
+            report.getGeneratorErrors().addAll(manifest.validate());
+            return manifest;
+        } catch (IOException e) {
+            report.getGeneratorErrors().add("字段改名清单读取失败：" + e.getMessage());
+            return new RenameManifest();
+        }
     }
 }
